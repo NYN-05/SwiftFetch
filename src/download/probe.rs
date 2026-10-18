@@ -33,8 +33,8 @@
 //! with the Phase 4 sequential transfer.
 #![allow(dead_code)]
 
-use crate::download::http::{HttpClient, PROBE_RANGE};
-use crate::error::{AppError, ErrorCategory};
+use crate::download::http::{http_status_error, HttpClient, PROBE_RANGE};
+use crate::error::AppError;
 use crate::logging::redact_url;
 use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED};
 use reqwest::{Method, StatusCode, Url};
@@ -79,11 +79,11 @@ pub(crate) enum ContentLength {
 
 /// A parsed `Content-Range` header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RangeSpec {
-    first: u64,
-    last: u64,
+pub(crate) struct RangeSpec {
+    pub(crate) first: u64,
+    pub(crate) last: u64,
     /// `Some(total)` for the explicit form, `None` when the server wrote `*`.
-    total: Option<u64>,
+    pub(crate) total: Option<u64>,
 }
 
 /// Content-transform state of a response body.
@@ -167,8 +167,10 @@ fn parse_content_length_value(raw: &str) -> ContentLength {
 /// Parses a raw `Content-Range`, e.g. `bytes 0-0/4096` or `bytes 0-499/*`.
 ///
 /// The `416` form (`bytes */N`) is rejected: a `206` answer to an exact
-/// range must name an exact, non-empty interval in byte units.
-fn parse_content_range(raw: &str) -> Option<RangeSpec> {
+/// range must name an exact, non-empty interval in byte units. The resume
+/// engine reuses this same strict parser for its own ranged responses
+/// (one parsing source, one trust policy).
+pub(crate) fn parse_content_range(raw: &str) -> Option<RangeSpec> {
     let rest = raw.trim().strip_prefix("bytes ")?;
     let (interval, total_text) = rest.split_once('/')?;
     let (first_text, last_text) = interval.trim().split_once('-')?;
@@ -397,8 +399,8 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
             return probe_by_ranged_get(client, &head_response.url().clone()).await;
         }
         let redacted = redact_url(base_url.as_str());
-        return Err(AppError::new(
-            ErrorCategory::Http,
+        return Err(http_status_error(
+            head_status,
             format!("the remote server responded HTTP {head_status} for {redacted}"),
         ));
     }
@@ -488,8 +490,8 @@ async fn probe_by_ranged_get(
         // unusable, there is no probe fact worth reporting: this resource
         // cannot be downloaded through the established paths.
         let redacted = redact_url(head_effective.as_str());
-        return Err(AppError::new(
-            ErrorCategory::Http,
+        return Err(http_status_error(
+            status,
             format!(
                 "the remote server responded HTTP {status} for {redacted} (HEAD and the ranged fallback both rejected)"
             ),

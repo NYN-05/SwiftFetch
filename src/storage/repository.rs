@@ -700,6 +700,31 @@ impl Repository {
         })
     }
 
+    /// Corrects the record's destination when finalization picked a
+    /// deterministic `(n)`-suffixed sibling instead of the planned name
+    /// (architecture §9: the record's destination points at the file that
+    /// actually exists, so recovery trusts it blindly). `updated_at`
+    /// becomes `ts`.
+    pub(crate) fn set_destination(
+        &self,
+        id: i64,
+        destination: &Path,
+        ts: u64,
+    ) -> Result<(), AppError> {
+        let destination = path_text("destination", destination)?;
+        let stamp = seconds_stamp(ts)?;
+        self.write_transaction("updating a download record", |transaction| {
+            let changed = transaction.execute(
+                "UPDATE downloads SET destination = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, destination, stamp],
+            )?;
+            if changed == 0 {
+                return Err(not_found("download record", id).into());
+            }
+            Ok(())
+        })
+    }
+
     /// Inserts a segment plan and returns its id.
     ///
     /// Ranges are inclusive byte spans; an inverted range, or a progress
@@ -1189,6 +1214,49 @@ mod tests {
         assert_eq!(record.retry_count, 2);
         assert_eq!(record.status, DownloadState::Downloading);
         assert_eq!(record.error_category, None);
+    }
+
+    /// Finalization sometimes lands on a deterministic `(n)` sibling; the
+    /// record must follow the file that actually exists, because recovery
+    /// (Phase 6 idempotence) trusts the destination column blindly.
+    #[test]
+    fn the_records_destination_follows_the_actual_finalized_file() {
+        let scratch = ScratchDb::new("destination");
+        let repo = scratch.open();
+        let id = insert(&repo, "https://db.test/destination", "destination");
+
+        repo.set_destination(
+            id,
+            &queued(url_fixture(), "sibling").destination,
+            1_700_000_002,
+        )
+        .expect("destination corrected");
+        let record = repo.get_download(id).expect("read back").expect("present");
+        assert_ne!(
+            record.destination,
+            queued(url_fixture(), "destination").destination,
+            "the planned name and the actual file differ by design here"
+        );
+        // The stamp moves with the write, exactly like the other mutators.
+        assert_eq!(record.updated_at, 1_700_000_002);
+
+        let err = repo
+            .set_destination(999, &record.destination, 1_700_000_003)
+            .expect_err("unknown ids cannot be updated");
+        assert_eq!(
+            err.category(),
+            ErrorCategory::Database,
+            "the missing id surfaces as a typed database error"
+        );
+        assert!(
+            err.message().contains("was not found"),
+            "the message names the absent record: {}",
+            err.message()
+        );
+    }
+
+    fn url_fixture() -> &'static str {
+        "https://db.test/destination"
     }
 
     #[test]

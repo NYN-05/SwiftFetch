@@ -44,7 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::download::http::HttpClient;
+use crate::download::http::{http_status_error, HttpClient};
 use crate::download::probe::{
     probe, response_meta, validate_url, ContentEncoding, ContentLength, ProbeResult,
 };
@@ -125,8 +125,8 @@ pub(crate) async fn download_sequential(
     let mut response = client.send(Method::GET, &effective_url, None).await?;
     let status = response.status();
     if status != StatusCode::OK {
-        return Err(AppError::new(
-            ErrorCategory::Http,
+        return Err(http_status_error(
+            status,
             format!("the remote server responded HTTP {status} for {redacted}"),
         ));
     }
@@ -227,7 +227,7 @@ pub(crate) async fn download_sequential(
 /// - otherwise the probe's recorded size fact (HEAD/`206` metadata);
 /// - a contradiction between the two is never silently resolved — the
 ///   transfer is refused, because at least one response lied.
-fn expected_size_of(
+pub(crate) fn expected_size_of(
     transfer: ContentLength,
     probed: Option<u64>,
     redacted_url: &str,
@@ -253,7 +253,7 @@ fn expected_size_of(
 
 /// Composes a mid-transfer failure with the received/written accounting so
 /// diagnostics always state how much data was actually durable.
-fn with_transfer_context(
+pub(crate) fn with_transfer_context(
     err: AppError,
     written: u64,
     expected: Option<u64>,

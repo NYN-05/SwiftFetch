@@ -4,9 +4,14 @@
 //! resource probing ([`probe`]). Phase 4 adds the sequential transfer
 //! engine ([`sequential`]) — one resource streamed to a Windows-safe file
 //! name and finalized by no-overwrite rename — with wait-free internal
-//! progress counters ([`progress`]). Segmented transfers and the retry
-//! policy arrive with their own phases per `DOCS/phases.md`; commands
-//! still dispatch honest not-implemented errors until Phase 11 wires them.
+//! progress counters ([`progress`]). Phase 6 makes the same engine
+//! durable across process restarts: [`resume`] reconciles unfinished
+//! records against the partial files on disk, revalidates remote identity,
+//! appends verified ranges, and returns honest exceptions to new callers;
+//! [`retry`] supplies the bounded transient-failure classification and
+//! backoff those flows share. Segmented transfers arrive with their own
+//! phase per `DOCS/phases.md`; commands still dispatch honest
+//! not-implemented errors until Phase 11 wires them.
 //!
 //! Transfer-law recap for this module: error statuses never write bytes,
 //! incomplete data never gains a final name, existing files are never
@@ -22,4 +27,6 @@
 pub mod http;
 pub mod probe;
 pub mod progress;
+pub mod resume;
+pub mod retry;
 pub mod sequential;

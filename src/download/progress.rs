@@ -59,6 +59,19 @@ impl Progress {
     pub(crate) fn largest_single_write(&self) -> u64 {
         self.largest_single_write.load(Ordering::Relaxed)
     }
+
+    /// Continues one transfer at `offset` reflected bytes (Phase 6 resume).
+    ///
+    /// The byte counters start where the transfer left off so final
+    /// accounting covers the *whole* transfer and the diagnostics of a
+    /// resumed, interrupted session stay truthful. The largest-single-write
+    /// metric is deliberately *not* seeded: it is a fact about this
+    /// invocation's own writes, and the files already on disk wrote them
+    /// in earlier sessions.
+    pub(crate) fn continue_from(&self, offset: u64) {
+        self.bytes_received.store(offset, Ordering::Relaxed);
+        self.bytes_written.store(offset, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -82,5 +95,24 @@ mod tests {
             4_096,
             "a smaller later write never lowers the maximum"
         );
+    }
+
+    #[test]
+    fn a_continued_transfer_counts_its_offset_without_inflating_this_invocation() {
+        let progress = Progress::shared();
+        progress.continue_from(4_096);
+        assert_eq!(progress.received(), 4_096);
+        assert_eq!(progress.written(), 4_096);
+        assert_eq!(
+            progress.largest_single_write(),
+            0,
+            "the resumed prefix was written by a previous session, not this one"
+        );
+
+        progress.record_written(512);
+        progress.record_received(512);
+        assert_eq!(progress.written(), 4_608);
+        assert_eq!(progress.received(), 4_608);
+        assert_eq!(progress.largest_single_write(), 512);
     }
 }

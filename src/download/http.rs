@@ -28,14 +28,16 @@
 // transfer. This is the sanctioned narrow `dead_code` waiver (see AGENTS.md).
 #![allow(dead_code)]
 
+use std::error::Error as StdError;
+use std::fmt;
 use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::error::{AppError, ErrorCategory};
 use crate::logging::redact_url;
-use reqwest::header::{HeaderValue, ACCEPT_ENCODING, RANGE};
-use reqwest::{Method, Url};
+use reqwest::header::{HeaderValue, ACCEPT_ENCODING, IF_RANGE, RANGE};
+use reqwest::{Method, StatusCode, Url};
 
 /// Connection timeout mandated by `DOCS/architecture.md` §6.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -129,6 +131,24 @@ impl HttpClient {
         url: &Url,
         range: Option<&str>,
     ) -> Result<reqwest::Response, AppError> {
+        self.send_with_validator(method, url, range, None).await
+    }
+
+    /// [`HttpClient::send`] plus the conditional-revalidation header for
+    /// resume: `if_range` carries the stored validator (`ETag` or raw
+    /// `Last-Modified` value) of a ranged request, so a compliant server
+    /// answers `206` only when the representation still matches.
+    ///
+    /// A mocked or revalidating-hostile server may ignore `If-Range`; retry
+    /// classification and the engine's own response cross-checks are what
+    /// make the answer safe.
+    pub(crate) async fn send_with_validator(
+        &self,
+        method: Method,
+        url: &Url,
+        range: Option<&str>,
+        if_range: Option<&str>,
+    ) -> Result<reqwest::Response, AppError> {
         let mut builder = self
             .client
             .request(method, url.as_str())
@@ -140,14 +160,24 @@ impl HttpClient {
                     .expect("internal range header values are always valid ASCII"),
             );
         }
+        if let Some(validator) = if_range {
+            builder = builder.header(
+                IF_RANGE,
+                // The resume planner validates representability before the
+                // value is ever handed here (unrepresentable validators
+                // select a full restart instead of a request).
+                HeaderValue::from_str(validator)
+                    .expect("the resume planner validated the validator as a header value"),
+            );
+        }
         match tokio::time::timeout(self.timeouts.metadata, builder.send()).await {
             Ok(response) => response.map_err(http_error),
-            Err(_elapsed) => Err(AppError::new(
-                ErrorCategory::Http,
+            Err(_elapsed) => Err(transport_failure_error(
                 format!(
                     "the remote server did not answer in time: {}",
                     redact_url(url.as_str())
                 ),
+                None,
             )),
         }
     }
@@ -165,14 +195,94 @@ impl HttpClient {
     ) -> Result<Option<Bytes>, AppError> {
         match tokio::time::timeout(self.timeouts.body_idle, response.chunk()).await {
             Ok(chunk) => chunk.map_err(http_error),
-            Err(_elapsed) => Err(AppError::new(
-                ErrorCategory::Http,
+            Err(_elapsed) => Err(transport_failure_error(
                 format!(
                     "the remote server stopped sending data during the transfer: {}",
                     redact_url(response.url().as_str())
                 ),
+                None,
             )),
         }
+    }
+}
+
+/// Builds the user-facing HTTP-status failure: the typed category and
+/// message plus a classification marker in the hidden source (Phase 6
+/// retry classification reads the marker, not the message).
+pub(crate) fn http_status_error(status: StatusCode, message: String) -> AppError {
+    AppError::new(ErrorCategory::Http, message)
+        .with_source(HttpFailure::with_status(status.as_u16()))
+}
+
+/// Builds a transport-level HTTP failure (timeouts, connection loss,
+/// mid-body drops): transient as a class once classified.
+fn transport_failure_error(message: String, reason: Option<reqwest::Error>) -> AppError {
+    let marker = HttpFailure::transport();
+    AppError::new(ErrorCategory::Http, message).with_source(match reason {
+        Some(err) => marker.with_reason(err),
+        None => marker,
+    })
+}
+
+/// Diagnostic marker attached as the hidden source of engine-known HTTP
+/// failures so Phase 6's retry classification reads structure instead of
+/// parsing error messages (`DOCS/phases.md` Phase 6: "bounded retries for
+/// eligible transient errors").
+///
+/// `status` is the HTTP status when the failure came from one; `None` marks
+/// transport-level failures (timeouts, connection loss, mid-body drops),
+/// which are transient as a class. The optional `reason` keeps the original
+/// diagnostic error (e.g. the `reqwest::Error`) reachable in the source
+/// chain; the user-facing message never gains it.
+#[derive(Debug)]
+pub(crate) struct HttpFailure {
+    status: Option<u16>,
+    reason: Option<Box<dyn StdError + Send + Sync>>,
+}
+
+impl HttpFailure {
+    /// A transport-level failure: no HTTP status was involved.
+    pub(crate) fn transport() -> Self {
+        Self {
+            status: None,
+            reason: None,
+        }
+    }
+
+    /// A failure that names an HTTP status (the server answered).
+    pub(crate) fn with_status(status: u16) -> Self {
+        Self {
+            status: Some(status),
+            reason: None,
+        }
+    }
+
+    /// Keeps the original diagnostic error behind the marker.
+    pub(crate) fn with_reason(mut self, reason: impl StdError + Send + Sync + 'static) -> Self {
+        self.reason = Some(Box::new(reason));
+        self
+    }
+
+    /// The HTTP status when the failure came from one.
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.status
+    }
+}
+
+impl fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.status {
+            Some(status) => write!(f, "HTTP status {status}"),
+            None => write!(f, "transport failure"),
+        }
+    }
+}
+
+impl StdError for HttpFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.reason
+            .as_deref()
+            .map(|err| err as &(dyn StdError + 'static))
     }
 }
 
@@ -197,15 +307,21 @@ pub(crate) fn http_error(err: reqwest::Error) -> AppError {
         Some(redacted) => format!("{reason}: {redacted}"),
         None => reason.to_owned(),
     };
-    AppError::new(ErrorCategory::Http, message).with_source(err)
+    AppError::new(ErrorCategory::Http, message)
+        .with_source(HttpFailure::transport().with_reason(err))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpClient, HttpTimeouts, BODY_IDLE_TIMEOUT, CONNECT_TIMEOUT, HEADER_TIMEOUT};
+    use super::{
+        http_status_error, transport_failure_error, HttpClient, HttpFailure, HttpTimeouts,
+        BODY_IDLE_TIMEOUT, CONNECT_TIMEOUT, HEADER_TIMEOUT,
+    };
     use crate::common::fixture::Fixture;
     use crate::common::server::{Behavior, MockServer};
-    use reqwest::Method;
+    use crate::error::{AppError, ErrorCategory};
+    use reqwest::{Method, StatusCode};
+    use std::error::Error as _;
     use std::time::{Duration, Instant};
 
     const DEFAULT_LEN: u64 = 4_096;
@@ -230,6 +346,55 @@ mod tests {
     #[test]
     fn the_default_client_builds_successfully() {
         let _client = HttpClient::default_client().expect("defaults build a client");
+    }
+
+    /// Phase 6 retry classification reads the hidden diagnostic chain, so
+    /// the diagnostic sites must keep their `HttpFailure` marker reachable
+    /// through `AppError::source` while the user-facing text stays the same.
+    #[test]
+    fn engine_failures_carry_the_classification_marker_in_the_hidden_source() {
+        let status_err = http_status_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the remote server responded HTTP 503 for /x".to_owned(),
+        );
+        assert_eq!(status_err.category(), ErrorCategory::Http);
+        let marker = status_err
+            .source()
+            .and_then(|source| source.downcast_ref::<HttpFailure>());
+        assert_eq!(marker.map(|failure| failure.status()), Some(Some(503)));
+
+        // Transport failures (the timeout/idle sites) mark no status: the
+        // whole class is transient for classification purposes.
+        let transport_err = transport_failure_error(
+            "the remote server did not answer in time: /x".to_owned(),
+            None,
+        );
+        let marker = transport_err
+            .source()
+            .and_then(|source| source.downcast_ref::<HttpFailure>());
+        assert_eq!(marker.map(|failure| failure.status()), Some(None));
+
+        // The original diagnostic stays reachable two hops deep
+        // (`AppError` -> `HttpFailure` -> reason); `http_error` embeds the
+        // `reqwest::Error` itself this way.
+        let inner = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        );
+        let wrapped = AppError::new(
+            ErrorCategory::Http,
+            "the request to the remote server failed: /x".to_owned(),
+        )
+        .with_source(HttpFailure::transport().with_reason(inner));
+        let reason = wrapped
+            .source()
+            .and_then(|source| source.downcast_ref::<HttpFailure>())
+            .and_then(|failure| failure.source())
+            .and_then(|reason| reason.downcast_ref::<std::io::Error>());
+        assert_eq!(
+            reason.map(|err| err.kind()),
+            Some(std::io::ErrorKind::ConnectionReset)
+        );
     }
 
     /// A body streamed slower than the metadata budget still completes:

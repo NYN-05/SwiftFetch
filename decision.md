@@ -920,5 +920,146 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0018 | Phase 5 lifecycle graph: 20 tested edges, category policy, extraction stays separate from completion | Accepted |
 
+## ADR-0019 - Phase 6 resume protocol: plan-before-network recovery, the min() trust rule, revalidated append-or-restart, bounded retries, and graceful-shutdown parking
+
+- **Status:** Accepted
+- **Date:** 2026-10-19
+- **Context:** Phase 6 adds single-file resume, retry, and restart
+  recovery for one URL + one output directory while the commands remain
+  unwired until Phase 11. The phase's hard constraints: a crash between a
+  file-system write and its database commit must be safe in both
+  directions; bytes may never be appended to a partial unless the remote
+  revalidates the continuing representation and answers with an exact
+  ranged response; retries must be bounded; shutdown must arrive at any
+  point and persist only trustworthy state; and the record's statuses move
+  only along the ADR-0018 graph.
+- **Decision:**
+  - **Plan before network.** `plan_for` derives the recovery verdict for
+    one `(url, output_dir)` scope from the database and the disk alone,
+    before any request:
+    `RecoveryPlan::{Fresh{record, partial}, AlreadyComplete{record},
+    FinalizeAvailable{record, segment, partial}, CompleteInPlace{record},
+    Resume{record, segment, partial, offset}}`.
+    `AlreadyComplete` touches and sends nothing (idempotent recovery for a
+    completed record whose destination file still matches its expected
+    name); a completed record whose file is missing is a typed `Database`
+    error that never re-runs the transfer; two unfinished records for one
+    scope are refused as an input error rather than resolved by guessing.
+  - **Trust rule (the min() law):** the resumable offset is
+    `min(database-confirmed segment progress, partial file length)` over
+    the newest non-`failed` `min_byte = 0` segment row of the record. A
+    disk shorter than the database claim deconfirms the row immediately
+    (`update_segment(state, file_len)`); a claim beyond the known expected
+    size, or a partial longer than the expected size, downgrades to
+    `Fresh` (restart into the same partial, truncated). A record whose
+    expected size is unknown, or which has no segment row, never appends:
+    no anchor means no append.
+  - **Crash-between-write-and-commit is closed in both directions:** the
+    stream fsyncs the partial *before* claiming the bytes in the segment
+    row (confirm cadence 1 MiB; the final claimed write happens only after
+    the closing `sync`), and the plan never trusts more than the disk
+    holds, so either side lagging the other leads to a smaller - never a
+    larger - optimistic offset.
+  - **Revalidated append-or-restart.** A `Resume` continuation is granted
+    only through all gates: a stored validator exists; `revalidate_identity`
+    concludes `Verified`/`Tentative` - comparable validator pairs only (an
+    ETag matches an ETag, a `Last-Modified` matches a `Last-Modified`; an
+    identity whose effective URL drifted elsewhere is `Changed`); range
+    support is proven by the probe's evidence; the ranged challenge is
+    answered `206 Partial Content` whose `Content-Range` starts exactly at
+    the offset, whose span agrees with the response length, and whose
+    total does not contradict the record's expected size; and the
+    response's own validators are cross-checked against the stored ones.
+    A `200` (fetch the full content that is in hand), a `416`, a
+    tentative identity confirmed only by the challenge, an unrepresentable
+    header value, and any contradiction all downgrade to a full restart
+    within the same attempt - and a restart never appends.
+  - **Bounded retries with per-process jitter.** `RetryPolicy::default`
+    allows 5 retries (`attempt_budget = max_retries + 1` attempts per
+    invocation), nominal delay 500 ms × 2^(attempt) capped at 8 s, full
+    jitter over `[0, nominal]` seeded from `RandomState` so simultaneous
+    failures do not synchronize. `classify` retries only transient
+    failures (5xx, unknown statuses, timeouts, transport drops,
+    premature-end) through the hidden `HttpFailure` marker carried in
+    sources; everything else fails the record at once. A transient failure
+    accumulates `retry_count` only when a record exists (the fresh flow
+    inserts its record after the first probe succeeds, so a pre-record
+    blip is retried but not counted), and shutdown during the backoff
+    parks the record `paused` with the count intact.
+  - **Graceful shutdown.** `ShutdownSignal`/`ShutdownHandle` trip a
+    `tokio::sync::watch` bool. The stream races every chunk read against
+    the signal; shutdown inside the stream syncs the partial, claims the
+    confirmed total in the segment row, moves the record to `paused`, and
+    returns a `Cancelled` error whose message promises `paused and`
+    `resumable`. Shutdown between phases is honored at the next boundary;
+    a metadata exchange already in flight finishes under its own bounded
+    timeout (ADR-0015) or fails transiently. Finalization itself is never
+    interrupted: the atomic rename always completes once claimed.
+  - **Finalization and best-effort status writes.** Finalization claims
+    the destination via an exclusive reservation, renames same-volume
+    under the no-overwrite policy (ADR-0016), records the divergence via
+    `set_destination` when the final name resolves elsewhere, and writes
+    `completed`. A failure to reserve/rename becomes a typed failure plus
+    a best-effort `failed` status write (category reuses the failure);
+    status or retry-count write failures during failure handling are
+    logged best-effort and never mask the transfer's own error - the
+    record remains recoverable, which is the point of parking.
+  - **Engine entry.** `transfer_persisted(client, repo, url, output_dir,
+    Arc<Progress>, &RetryPolicy, now, &ShutdownHandle) -> Result<
+    SequentialDownload, AppError>` is the one persisted engine entry
+    point; its eight parameters are the wiring contract Phase 11 will
+    satisfy exactly once per configured download (narrow
+    `too_many_arguments` waiver on the function).
+- **Alternatives considered:**
+  1. **Trust the database claim alone** (sum of segment received bytes) -
+     rejected: a crash between write and commit would append a hole or
+     duplicate bytes onto a shorter file forever; the trust minimum exists
+     precisely because fs + SQLite are not one transaction.
+  2. **Trust the partial length alone without deconfirming** - rejected:
+     silently held progress would re-plans forever larger; the row is
+     corrected down so that the database and the disk agree by the time
+     the plan is used, and repeated reconstruction is idempotent.
+  3. **`If-Range` trust alone** (send the stored validator, trust the
+     response) - rejected: a server may ignore `If-Range` and answer `206`
+     with unmatched bytes; the engine cross-checks echoed validators
+     against the record so a lying or range-ignorant server can never
+     produce a mixed content stream through this path.
+  4. **Validate only status/`Content-Range` on the challenge; accept an
+     unvalidated first-chunk append** - rejected: contradicts the phase
+     law "never append without revalidation"; the strictness also costs
+     nothing in cases where the mock's honest answers are used.
+  5. **Retry backoff without jitter / per-attempt linear backoff** -
+     rejected: synchronized retries would stampede the remote after an
+     outage; the exponential-with-full-jitter shape is standard and cheap.
+  6. **Shutdown by aborting the task / dropping futures** - rejected:
+     resurrect-time state must be trustworthy without a journal; explicit
+     park (sync → claim → `paused`) gives the record a durable, replayable
+     resting state (`Interrupted`), and the process-level kill path is
+     just the Phase 6 startup recovery running against whatever parts of
+     that park landed.
+- **Consequences:**
+  - The truth rule and downgrade matrix are part of the contract: changing
+    any gate requires updating the ADR and its tests together.
+  - The `200`-falls-back-to-full-content rule wastes no bytes but also
+    never lets a `206` masquerade as full content: a ranged response to a
+    non-ranged request is an `Http` failure, not file content.
+  - Records whose partial file grows beyond the expected size restart on
+    recovery; nothing about partial sizes is user-visible state.
+  - The engine is honest about progress accounting: a resume's
+    `bytes_written` reports the whole session's streamed total including a
+    resumed prefix, while the DB records only what this process added.
+  - The retry budget is per invocation, not global: successive user-invoked
+    runs of the same download each reset the attempt budget while
+    `retry_count` keeps the cumulative story in the record.
+- **Related:** ADR-0015 (timeout policy), ADR-0016 (naming/finalization),
+  ADR-0017 (repository/storage), ADR-0018 (lifecycle graph), `DOCS/
+  phases.md` Phase 6, `changes.md` Phase 6 entry.
+
+### Addendum-index extension (ADR-0019 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0019 | Phase 6 resume protocol: plan-before-network recovery, min() trust rule, revalidated append-or-restart, bounded retries, graceful shutdown parking | Accepted |
+
 
 

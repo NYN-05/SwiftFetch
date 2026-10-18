@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{AppError, ErrorCategory};
 
@@ -77,6 +77,7 @@ pub(crate) fn ensure_output_dir(dir: &Path) -> Result<(), AppError> {
 }
 
 /// A validated partial-transfer file with its engine-owned name.
+#[derive(Debug)]
 pub(crate) struct PartialFile {
     path: PathBuf,
     file: tokio::fs::File,
@@ -123,6 +124,101 @@ impl PartialFile {
     /// The identifiable partial-file path (owned by the engine, never user data).
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Reopens an engine-owned partial file for writing at a trusted byte
+    /// offset (Phase 6 resume; the reconciled
+    /// `min(database-confirmed, on-disk)` progress).
+    ///
+    /// The file is truncated *down* to `offset` when it is longer: bytes
+    /// beyond the confirmed mark cannot be proven to belong to the
+    /// validated stream and are discarded before anything is appended. The
+    /// truncate is synced immediately, so the database record may never
+    /// rely on data the disk no longer holds, and the write cursor is
+    /// positioned exactly at `offset` for the resumed appends.
+    ///
+    /// The file is opened without truncation *and* without creation: a
+    /// vanished (or unopenable) partial is a [`ErrorCategory::Filesystem`]
+    /// error, never a fresh file, and a file shorter than the offset is
+    /// refused outright — trusting the database over the file would
+    /// fabricate transferred data. Use offset `0` to deliberately restart
+    /// into an existing partial (truncate to empty, then append).
+    pub(crate) async fn resume_at(path: PathBuf, offset: u64) -> Result<Self, AppError> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|err| {
+                fs_failure(
+                    format!(
+                        "the partial file {} could not be reopened for resume: {err}",
+                        path.display()
+                    ),
+                    err,
+                )
+            })?;
+        let current = file
+            .metadata()
+            .await
+            .map_err(|err| {
+                fs_failure(
+                    format!(
+                        "the partial file {} could not be measured for resume: {err}",
+                        path.display()
+                    ),
+                    err,
+                )
+            })?
+            .len();
+        if current < offset {
+            return Err(AppError::new(
+                ErrorCategory::Filesystem,
+                format!(
+                    "the partial file {} holds {current} bytes, fewer than the {offset} \
+                     confirmed bytes the download database claims; trusting the database \
+                     over the file would fabricate transferred data, so the resume is \
+                     refused",
+                    path.display()
+                ),
+            ));
+        }
+        if current > offset {
+            file.set_len(offset).await.map_err(|err| {
+                fs_failure(
+                    format!(
+                        "the partial file {} could not be truncated to the confirmed \
+                         {offset} bytes (it held {current}): {err}",
+                        path.display()
+                    ),
+                    err,
+                )
+            })?;
+        }
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|err| {
+                fs_failure(
+                    format!(
+                        "the partial file {} could not be positioned at byte {offset} for \
+                     the resumed writes: {err}",
+                        path.display()
+                    ),
+                    err,
+                )
+            })?;
+        // The truncation must be durable before any later database record is
+        // allowed to rely on it.
+        file.sync_all().await.map_err(|err| {
+            fs_failure(
+                format!(
+                    "the resumed partial file {} could not be synced after truncating \
+                     to byte {offset}: {err}",
+                    path.display()
+                ),
+                err,
+            )
+        })?;
+        Ok(Self { path, file })
     }
 
     /// Writes one body chunk and reports its size, keeping all writes
@@ -475,5 +571,83 @@ mod tests {
             "the message names the directory: {}",
             err.message()
         );
+    }
+
+    /// Phase 6's trust rule in file form: only the database-confirmed bytes
+    /// may back the resume, so the four unverifiable tail bytes are
+    /// truncated away and the cursor continues exactly at the offset.
+    #[test]
+    fn resumed_partials_truncate_to_and_continue_from_the_trusted_offset() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async move {
+            let dir = ScratchDir::new("resume-at");
+            let path = dir.path().join("target.bin.swiftfetch-9-1.part");
+            // Ten bytes on disk, six confirmed in the database: the tail
+            // four cannot be proven to belong to the validated stream.
+            std::fs::write(&path, b"0123456789").expect("partial staged");
+
+            let mut partial = PartialFile::resume_at(path.clone(), 6)
+                .await
+                .expect("partial reopened at the trusted offset");
+            partial.write_chunk(b"xyz").await.expect("resumed append");
+
+            assert_eq!(
+                std::fs::read(&path).expect("read"),
+                b"012345xyz",
+                "the untrusted tail was discarded and the append landed at the offset"
+            );
+
+            // The reopened partial finalizes like any other.
+            let reserved = reserve_destination(dir.path(), "target.bin").expect("free name");
+            let moved = finalize(partial, reserved).await.expect("finalized");
+            assert_eq!(std::fs::read(moved).expect("read"), b"012345xyz");
+        });
+    }
+
+    /// A partial shorter than the database's confirmed progress cannot back
+    /// the resume without fabricating transferred data; the resume is
+    /// refused so the reconciliation can deconfirm or restart instead.
+    #[test]
+    fn a_partial_shorter_than_the_trusted_offset_is_refused() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async move {
+            let dir = ScratchDir::new("resume-short");
+            let path = dir.path().join("short.swiftfetch-9-1.part");
+            std::fs::write(&path, b"12345").expect("partial staged");
+
+            let err = PartialFile::resume_at(path, 10)
+                .await
+                .expect_err("the resume cannot be trusted onto the file");
+            assert_eq!(err.category(), ErrorCategory::Filesystem);
+            assert!(
+                err.message().contains("fabricate transferred data"),
+                "the message must state the trust refusal: {}",
+                err.message()
+            );
+        });
+    }
+
+    /// A vanished partial is a caller error, never a fresh file: the resume
+    /// must not silently start over through an unconditional create.
+    #[test]
+    fn a_missing_partial_refuses_to_resume_instead_of_recreating() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async move {
+            let dir = ScratchDir::new("resume-missing");
+            let path = dir.path().join("gone.swiftfetch-9-1.part");
+            let err = PartialFile::resume_at(path, 4)
+                .await
+                .expect_err("the partial does not exist");
+            assert_eq!(err.category(), ErrorCategory::Filesystem);
+            assert!(
+                err.message().contains("could not be reopened"),
+                "the message must name the reopen failure: {}",
+                err.message()
+            );
+            assert!(
+                !dir.path().join("gone.swiftfetch-9-1.part").exists(),
+                "no file may be created by a refused resume"
+            );
+        });
     }
 }

@@ -901,6 +901,199 @@ with the three integration targets (11 cli, 15 fixtures, 24 mock_server).
 | `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 22.2 s check) |
 | `cargo test` | 184 passed, 0 failed (134 unit + 11 cli + 15 fixtures + 24 mock_server), identical to the working-tree run |
 
+## Phase 6 - Single-File Resume, Retry, and Restart Recovery
+
+- **Date:** 2026-10-19
+- **Version:** `0.7.0` → `0.8.0`
+- **Outcome:** Phase 6 exit gate met (working tree). The Phase 4 transfer
+  engine now survives process death: one URL + one output directory is
+  driven through probe → stream → finalize with every trustworthy step
+  committed to the SQLite record first, and every invocation
+  reconciles unfinished records against the partial files on disk
+  *before* any network work (`plan_for` → `RecoveryPlan`, ADR-0019).
+  The trust rule is
+  `min(database-confirmed segment progress, partial file length)`, so a
+  crash between a file write and its database commit is safe in both
+  directions (the stream fsyncs before claiming bytes; a shorter disk
+  deconfirms the row immediately). Appends only ever follow revalidation -
+  a stored validator, unchanged identity evidence, proven range support,
+  an exact `206` whose `Content-Range` starts at the offset and whose
+  validators cross-check against the record - and anything ambiguous
+  restarts whole instead of appending, reusing the same partial truncated
+  to zero. Retries are bounded (default `RetryPolicy`: 5 retries = 6
+  attempts per invocation, 500 ms full-jitter exponential backoff capped
+  at 8 s, classification through hidden `HttpFailure` markers). Graceful
+  shutdown (tokio `watch`) parks a mid-stream record `paused` with
+  confirmed progress durable; shutdown inside the retry backoff parks the
+  same way with the retry count intact. A record whose partial already
+  holds every byte finalizes locally without the network; a completed
+  record is reported without re-running; finalization reuses the
+  Phase 4 reserve + rename protocol (ADR-0016) and corrects the record's
+  destination when the no-overwrite policy lands on a `(n)` sibling.
+  Commands remain honest not-implemented (wiring is Phase 11, calling
+  `transfer_persisted`). No segmented scheduling, no extraction.
+
+### Dependency and feature changes (approved stack, in-place)
+
+tokio `features` gains `"sync"` - the `watch` channel behind
+`ShutdownSignal::channel()`. No new crates (ADR-0003 discipline); `git diff
+--stat Cargo.lock` shows only the `swift-fetch` version line moving
+(2 lines touched). Dev-dependencies unchanged from Phase 2/3.
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | version `0.8.0`; tokio gains `"sync"` with the first-use comment naming the shutdown handle |
+| `Cargo.lock` | version line only |
+| `src/download/resume.rs` | NEW, 2788 lines, 27 tests. The durable engine and its full test module: `plan_for(record scope) -> RecoveryPlan` (five verdicts: `Fresh{record, partial}` / `AlreadyComplete{record}` / `FinalizeAvailable{record, segment, partial}` / `CompleteInPlace{record}` / `Resume{record, segment, partial, offset}`), reconcile + trust rules (`scan_partials` for engine-owned `*.swiftfetch-<pid>-<seq>.part` files, `RECOVERABLE` state filter with idempotent `walk_to_downloading`, deconfirmation via `update_segment(state, file_len)`), `revalidate_identity` → `Identity::{Verified, Tentative, Changed, Unverifiable}` (comparable-pair-only matching plus effective-URL sameness), `resume_attempt` (gates, ranged challenge via `send_with_validator`, strict `parse_content_range` validation, 200/416 → restart, premature end → transient), `full_transfer` (restart reuses/truncates the same partial; fresh flow inserts the record only after the first probe succeeds), `stream_transfer` (per-chunk progress, 1 MiB confirm cadence via `PROGRESS_CONFIRM_INTERVAL_BYTES`, chunk reads raced against shutdown), `interrupt_stream` (sync → claim → `paused`, returns an honest `Cancelled` message), `finalize_claimed`/`finalize_available` (ADR-0016 rename choreography + `set_destination` correction + best-effort failure writes that never mask the original error), `transfer_persisted` (the eight-parameter entry Phase 11 wires; per-invocation attempt budget = `max_retries + 1`, full-jitter backoff between attempts, exhaustion fails the record with `RetryExhausted`), plus decision-table unit tests for `plan_for` and identity revalidation |
+| `src/download/retry.rs` | NEW, 337 lines, 11 tests. `RetryPolicy {max_retries: 5, base_delay: 500 ms, factor: 2, max_delay: 8 s}` with `Default`/`from_retries`; `attempt_budget()`; `nominal_delay(attempt)` and `delay_for(attempt)` (full jitter over `[0, nominal]`, per-process seed via `RandomState`); `classify(&AppError) -> RetryVerdict::{Transient, Permanent}` walks the hidden diagnostic chain (`HttpFailure` markers, reqwest's own timeout/connect/body/decode flags) so only server-answered 5xx, unknown statuses, timeouts, transport drops, and premature ends retry; per-process jitter means simultaneous failures do not synchronize |
+| `src/download/http.rs` | `HttpFailure` classification marker (optional `u16` status + hidden reason), `StdError` impl, redacted-display; `http_status_error(status, message)` and `transport_failure_error(message, reason)` now carry the marker through `AppError`'s source chain; `send_with_validator(method, url, range, if_range)` sends `Accept-Encoding: identity` plus optional `Range`/`If-Range` from one shared client; tests 4 → 5 (marker visible two hops deep) |
+| `src/download/probe.rs` | `RangeSpec {first, last, total}` + strict `parse_content_range(raw)` - untrusted `Content-Range` text is parsed exactly or refused (never guessed), shared with the engine's challenge validation |
+| `src/download/progress.rs` | `continue_from(offset)` starts a resumed session's byte counters at the trusted offset so whole-transfer accounting stays truthful; `largest_single_write` deliberately not seeded (it is a fact of this invocation's own writes); + 1 test |
+| `src/download/sequential.rs` | `expected_size_of` made `pub(crate)` (shared with the resume engine); status failures now go through `http_status_error` so retry classification sees the marker |
+| `src/download/mod.rs` | declares `resume` and `retry`; module docs state the durable-engine recap |
+| `src/storage/file_writer.rs` | `resume_at(path, offset)` opens, validates, and truncates an existing partial to the trusted offset; a missing partial or one shorter than the offset refuses to resume instead of silently recreating (preservation law); close-time `sync` before claims land; + 3 tests |
+| `src/storage/repository.rs` | `set_destination(id, destination, ts)` - after a `(n)`-sibling finalization the record follows the file that actually exists (recovery trusts the destination column blindly); + 1 test |
+| `tests/common/server.rs` | Phase 6 knobs: `with_fail_first(count, status)` (first `count` requests on the route answer a status sentinel), `with_truncate_first(count, after)` (first `count` body-path responses stop mid-body after `after` bytes; HEAD and status-override routes unaffected), and the `choose_body` plumbing that applies both; the countdown is consumed only by requests that reach the normal body path |
+| `decision.md` | ADR-0019 appended |
+
+### Mock-server disclosure - truncation semantics corrected before commit
+
+`TestBody::truncate_after` originally ended a truncated body with an
+explicit stream error. That poisons reqwest's pooled connection: the next
+request handed to that connection fails with "connection closed before
+message completed" before any of its own bytes are delivered, so every
+multi-attempt scenario measured connection reuse instead of truncation
+(found through temporary engine diagnostics, then removed). Truncation now
+ends with a clean mid-body EOF - what a dropped connection looks like at
+the HTTP layer; the mock's own contract test
+(`truncated_transfers_abort_mid_body_repeatedly`) still passes. Related
+accounting fact, covered by tests: the probe's `bytes=0-0` evidence GET
+reaches the normal body path and consumes `truncate_first` slots, so a
+scenario wanting `n` truncated transfer GETs must budget `n + probes`
+slots; the phase tests do this explicitly.
+
+### Defects caught before commit (recorded honestly)
+
+1. **The pooled-connection poisoning above** - chronological fix order:
+   engine diagnosis (temporary `eprintln!` instrumentation around chunk
+   reads and partial creation), mock-semantics correction, then
+   instrumentation removal (the committed tree carries none).
+2. **Countdown-slot accounting** - the first draft expected two transfer
+   truncations from `truncate_first(2, 512)`; the probe's evidence GETs
+   consume the first slots. Corrected to explicit math in the tests
+   (`truncate_first(4, ...)` for two transfer drops; `9` route hits for
+   three fully-probed attempts).
+3. **A wrong unit-test premise in `http.rs`** - `io::Error::other("...")
+   ` does not carry `ErrorKind::ConnectionReset`; the test assumed a kind
+   it never had. Fixed by constructing the kind explicitly, so the
+   downcast demonstration is deterministic on every toolchain.
+4. **A mis-anchored test edit fused two tests together** during this
+   phase's final editing pass; caught by `cargo check`, repaired, and the
+   test inventory re-counted (27 resume tests, each named and asserted
+   exactly once).
+5. Mechanical `cargo fmt` reflows after compiling; no semantic change.
+
+### Behavior contract (Phase 6)
+
+- `plan law`: every invocation starts as pure inspection - `plan_for`
+  reads the database and the disk only; network work begins after a plan
+  verdict exists. Two unfinished records for one `(url, dir)` scope are
+  refused, never resolved by guessing.
+- `trust law` (ADR-0019): resumable offset = min(DB-confirmed, on-disk);
+  deconfirmation is a persisted correction, not a comment; no segment
+  anchor or unknown expected size forces `Fresh`.
+- `identity law`: appends require a stored validator and `Verified`/
+  `Tentative` revalidation comparable-pair-only (ETag vs ETag,
+  Last-Modified vs Last-Modified, effective URL unchanged); a drifted
+  identity is `Changed` and restarts.
+- `never-append law`: the challenge must answer `206` exactly from the
+  offset with a consistent span and total; a `200` means "use the full
+  content that is already in hand" (restart path, bytes never wasted); a
+  `206` answering a non-ranged request is an `Http` failure, never file
+  content (unit-locked at the parser/status gates; the mock cannot
+  produce that shape, see honesty notes).
+- `restart law`: a restart never appends; it truncates the same engine
+  partial to zero and refetches, byte-exactly, without a tail-offset
+  challenge ever leaving the client.
+- `retry accounting`: transient failures count only when a record exists;
+  the fresh flow inserts after the first successful probe, so pre-record
+  blips retry silently, within the per-invocation budget; exhaustion
+  fails the record with `RetryExhausted` and preserves any partial.
+- `shutdown law`: shutdown arrives as data race-free (every chunk read
+  raced against the `watch`), synchronizes the partial before claiming
+  bytes (write-before-claim ordering), and parks `paused` - both
+  mid-stream (retry count untouched) and during backoff (retry count
+  kept); the parked message says `paused and resumable`, and the record
+  replays through the plan law on the next run.
+- `idempotency law`: a completed record with its file present is reported
+  without touching or sending anything; finalization-so-far states
+  (`FinalizeAvailable`, `CompleteInPlace`) resolve locally; recovery
+  tests leave no bytes doubled or holed (asserted byte-exact after
+  restarts and resumes).
+- `CLI law` (unchanged, still test-locked): every command prints the
+  honest not-implemented line to stderr with exit 1; stdout stays
+  reserved for results; logs go to stderr with `redact_url`.
+
+### Verification - actual results (all run on Windows)
+
+Working tree, in the ADR-0008 order:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (one `cargo fmt` round after the final edits; re-run clean) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (five `useless_vec` call sites in test code converted to array literals along the way) |
+| `cargo test` | **228 passed, 0 failed** = 178 unit + 11 cli + 15 fixtures + 24 mock_server (unit run ~69 s; mock_server target ~2 s) |
+
+Observed per-module unit counts (`--list`): app 3, cli 9, common::fixture 6,
+config 7, download::http 5, download::probe 37, download::progress 2,
+download::retry 11, download::resume 27, download::sequential 25, error 5,
+logging 5, storage::file_writer 9, storage::repository 19,
+storage::schema 8 (Phase 5 baseline 134 → 178).
+
+- The CLI behavior contract is untouched and still locked by its Phase 1
+  tests.
+- The ADR-0014 double-count disclosure still applies: the six common
+  fixture inline tests run in multiple targets.
+- Windows honesty: every check ran on Windows (MSVC, rustc 1.99.1),
+  including the Windows-specific behaviors exercised by the tests (partial
+  truncation, same-volume rename finalization, scan semantics, forced-path
+  recovery). The one law the mock *cannot* shape - a `206` answering a
+  non-ranged request - is covered analytically by unit-locked parser and
+  status gates, not by a fixture, and is disclosed here as such. The mock
+  also never answers `If-Range` specially; engine-side validator
+  cross-checks are the tested safety net, and the `If-Range` header value
+  itself is asserted from the captured request log.
+- `dead_code` waivers: file-level in the two NEW modules (`resume.rs`
+  citing Phase 11's command wiring; `retry.rs` noting its Phase 6 engine
+  callers and later command-facing surface), plus the auxiliary
+  `#[allow(clippy::too_many_arguments)]` on the ADR-0019-recorded eight-
+  parameter entry and the restart fetch. Nothing else was suppressed.
+- Disclosed limitations, honest for this phase: the engine has no
+  production caller yet (commands stay not-implemented until Phase 11);
+  backoff timing is never waited on in tests (the shutdown-during-backoff
+  test uses a test-local 60 s policy so the trip lands deterministically
+  inside the wait); retry-with-jitter behavior is exercised through the
+  budget and classification paths, not wall-clock waits; the sentinel-
+  outage and restart tests prove idempotent recovery for the states they
+  stage, but a real crash mid-write is simulated by staging the
+  post-crash states directly (the trust rule's min() shape is what makes
+  that staging sound).
+
+### Scope-control notes
+
+- No segmented (multi-connection, per-segment scheduling) transfers - the
+  architecture reserves them for a later phase; the `segments` table is
+  used with a single full-span segment per download for now.
+- No queue concurrency, no pause/resume commands, no extraction, no GUI,
+  no telemetry - their phases per `DOCS/phases.md`.
+- The engine is a tested layer with its callers in Phase 11 wiring, per
+  the same pattern as Phase 4/5 (`transfer_persisted` is the pointed-at
+  entry, ADR-0019).
+- Tracking files: both appends observe ADR-0010 (append-only at the very
+  bottom; supersession by reference, never rewording).
+
 
 
 

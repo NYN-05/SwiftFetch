@@ -120,6 +120,18 @@ pub struct Behavior {
     /// how a content transformation that invalidates byte offsets is
     /// simulated.
     pub content_encoding: Option<String>,
+    /// Phase 6 transient-outage countdown: the first `count` requests on
+    /// this route answer `status` with a sentinel body instead of normal
+    /// handling; from request `count + 1` on, the route behaves healthy.
+    /// Countdown answers are not counted by [`MockServer::route_hits`]
+    /// (the same convention as other sentinel responses).
+    pub fail_first: Option<(u64, u16)>,
+    /// Phase 6 mid-body-drop countdown: the first `count` GET requests that
+    /// reach the normal body path stream only `after` bytes and then abort
+    /// the connection; from then on the route behaves healthy (the static
+    /// [`Behavior::truncate_after`] still applies to every request).
+    /// HEAD requests never consume this countdown.
+    pub truncate_first: Option<(u64, u64)>,
 }
 
 impl Default for Behavior {
@@ -139,6 +151,8 @@ impl Default for Behavior {
             head_content_length: None,
             get_status: None,
             content_encoding: None,
+            fail_first: None,
+            truncate_first: None,
         }
     }
 }
@@ -233,6 +247,21 @@ impl Behavior {
         self.content_encoding = Some(encoding.into());
         self
     }
+
+    /// First `count` requests fail with `status`, then the route is healthy.
+    #[must_use]
+    pub const fn with_fail_first(mut self, count: u64, status: u16) -> Self {
+        self.fail_first = Some((count, status));
+        self
+    }
+
+    /// First `count` GETs stream only `after` bytes and drop the
+    /// connection, then the route is healthy.
+    #[must_use]
+    pub const fn with_truncate_first(mut self, count: u64, after: u64) -> Self {
+        self.truncate_first = Some((count, after));
+        self
+    }
 }
 
 /// One request as observed by the mock server, in arrival order.
@@ -254,6 +283,9 @@ struct Shared {
     hits: Mutex<HashMap<String, u64>>,
     log: Mutex<Vec<RecordedRequest>>,
     shutdown: watch::Sender<bool>,
+    /// Countdown per route (Phase 6 knobs): fail_first keyed by the route
+    /// path, truncate_first by `"<path>\0truncate"` so one map holds both.
+    failures: Mutex<HashMap<String, u64>>,
 }
 
 /// A mock HTTP server bound to an ephemeral loopback port.
@@ -284,6 +316,7 @@ impl MockServer {
             hits: Mutex::new(HashMap::new()),
             log: Mutex::new(Vec::new()),
             shutdown: shutdown_tx,
+            failures: Mutex::new(HashMap::new()),
         });
         let shared_for_accept = Arc::clone(&shared);
         let accept = tokio::spawn(async move {
@@ -614,7 +647,13 @@ impl TestBody {
             frames.push_back((delay, bytes));
         }
         self.frames = frames;
-        self.error_after = Some(self.frames.len());
+        // A truncation ends the stream like a dropped connection: the server
+        // simply stops sending (clean EOF). Injecting an explicit stream
+        // error instead would poison the pooled connection on the client
+        // side, so the NEXT request on that connection would fail before
+        // any bytes of its own were delivered - which would make every
+        // multi-attempt scenario depend on internals rather than the
+        // truncation itself.
         self
     }
 }
@@ -665,7 +704,12 @@ impl Body for TestBody {
 /// `Content-Length` is requested. 512-byte frames keep frame counts small.
 const STREAM_CHUNK: usize = 512;
 
-fn choose_body(data: &Arc<Vec<u8>>, advertised_len: u64, behavior: &Behavior) -> TestBody {
+fn choose_body(
+    data: &Arc<Vec<u8>>,
+    advertised_len: u64,
+    behavior: &Behavior,
+    truncate_keep: Option<u64>,
+) -> TestBody {
     let omit_cl = behavior.omit_content_length;
     let delay = (behavior.delay_body_ms > 0).then(|| Duration::from_millis(behavior.delay_body_ms));
     let mut body = TestBody::stream(
@@ -674,7 +718,7 @@ fn choose_body(data: &Arc<Vec<u8>>, advertised_len: u64, behavior: &Behavior) ->
         delay,
         if omit_cl { None } else { Some(advertised_len) },
     );
-    if let Some(keep) = behavior.truncate_after {
+    if let Some(keep) = truncate_keep {
         body = body.truncate_after(keep);
     }
     body
@@ -748,6 +792,24 @@ async fn handle(
         return Ok(response);
     }
 
+    // Phase 6 transient-outage countdown: deterministic failure responses
+    // precede any other handling, then the route behaves healthy.
+    if let Some((count, status)) = behavior.fail_first {
+        let mut countdown = shared.failures.lock().expect("failure countdown lock");
+        let served = countdown.entry(route_key.clone()).or_insert(0);
+        if *served < count {
+            *served += 1;
+            drop(countdown);
+            let sentinel = format!("status-{status}");
+            let len = sentinel.len() as u64;
+            let response = Response::builder()
+                .status(status_code(status))
+                .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+                .expect("countdown failure response builds");
+            return Ok(response);
+        }
+    }
+
     if behavior.status != 200 {
         let sentinel = format!("status-{}", behavior.status);
         let len = sentinel.len() as u64;
@@ -818,6 +880,22 @@ async fn handle(
             .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
             .expect("GET status-override response builds"));
     }
+    // Phase 6 mid-body-drop countdown: only GETs that reach the normal body
+    // path consume it, so HEAD probes and status-override routes stay
+    // unaffected; after the countdown the truncation must not recur.
+    let mut truncate_keep = behavior.truncate_after;
+    if method != Method::HEAD {
+        if let Some((count, after)) = behavior.truncate_first {
+            let key = format!("{route_key}\u{0}truncate");
+            let mut countdown = shared.failures.lock().expect("failure countdown lock");
+            let served = countdown.entry(key).or_insert(0);
+            if *served < count {
+                *served += 1;
+                drop(countdown);
+                truncate_keep = Some(after);
+            }
+        }
+    }
     let (range_status, content_range, data, advertised): (u16, Option<String>, Arc<Vec<u8>>, u64) =
         match parse_range(range_header.as_ref(), fixture.len) {
             RangeParse::Absent | RangeParse::Malformed => (200, None, fixture.bytes(), fixture.len),
@@ -877,7 +955,7 @@ async fn handle(
         );
     }
     let response = response_builder
-        .body(choose_body(&data, advertised, &behavior))
+        .body(choose_body(&data, advertised, &behavior, truncate_keep))
         .expect("mock response builds");
     Ok(response)
 }
