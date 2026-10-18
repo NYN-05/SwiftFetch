@@ -319,3 +319,73 @@ only by the project owner.
   errors and validation errors share exit code 2 by design.
 - **Related:** ADR-0003 (deps onboarded at first use), ADR-0005
   (superseded banner), ADR-0008 (verification recipe).
+
+---
+
+## Tracking addendum — appended 2026-10-18 (owner-directed, append-only)
+
+**Placement rule going forward (owner direction):** every future update to
+this file is appended at the very bottom. New ADRs take the next ID;
+corrections never edit historical records in place. Nothing above this
+addendum will be rewritten, moved, or deleted, including records that predate
+this rule.
+
+### ADR-0010 — Append-only bottom placement for tracking files (owner-directed)
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** The owner directed that `changes.md` and this file be
+  maintained with strictly appended updates — "add all new updates to the
+  very bottom; do not delete or overwrite any previous content" — after
+  discovering that a Phase 1 documentation edit had destroyed the Phase 0
+  section heading in `changes.md` (full disclosure in that file's
+  bottom addendum dated 2026-10-18).
+- **Decision:** Tracking updates are strictly append-only at the bottom of
+  each file. Superseded decisions are marked through *new* records that
+  reference the superseded ID (and through bottom addenda), not through
+  editing an old record's existing status line.
+- **Alternatives considered:**
+  1. Conventional in-place "Superseded" status flips on old ADR records —
+     now rejected by owner policy: in-place edits are indistinguishable from
+     accidents in history, and an in-place edit is exactly how the Phase 0
+     heading was destroyed.
+  2. Newest-first insertion (the original `changes.md` convention) —
+     superseded by this policy; bottom-append is the only mode guaranteed
+     never to touch existing bytes.
+- **Tradeoffs:** The newest state of a file sits behind older content, so
+  scanning to the bottom is required to read the current truth;
+  superseded/changed details are no longer annotated inline (mitigation:
+  disclosure addenda, like this one, record every such state change). The
+  index table at the top is frozen as-written and cannot be extended in
+  place — the "Addendum-index" below serves as its formal extension, and any
+  inconsistency between frozen index entries and later records is resolved
+  by disclosure, not by table edits.
+- **Related:** ADR-0005 (its in-place status flip predates this rule and is
+  disclosed below), ADR-0009 (banner supersession reference).
+
+### Addendum-index (formal extension of the frozen index table above)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0010 | Append-only bottom placement for tracking files (owner-directed) | Accepted |
+
+### Integrity disclosure — in-place mutations recorded before this rule
+
+1. **ADR-0005 `Status:` line.** Changed in place, from the original
+   "**Accepted**" to "**Superseded** ((banner contract and Phase 0 test set
+   replaced by the Phase 1 CLI contract — see ADR-0009). The
+   `CARGO_BIN_EXE_*` integration-test technique itself is retained and
+   extended.)", during commit `9903795` (Phase 1). The change aligns with
+   the record's rationale and ADR-0009, but it was an in-place edit, which
+   the new rule forbids going forward. Note: the frozen index table above
+   still lists ADR-0005 as "Accepted"; per the frozen-index tradeoff, that
+   inconsistency is resolved by this disclosure (authoritative status: the
+   record's status line read together with ADR-0009), not by editing the
+   table.
+2. **`changes.md` Phase 0 heading loss.** Disclosed in that file's bottom
+   addendum of the same date; the Phase 0 record body survived fully.
+3. **ADR-0006 contains two typos** ("bf: rebencing edition later …" — the
+   intended text was "Tradeoffs: rebasing edition later also rewrites
+   `Cargo.lock`/target state; do it in a dedicated commit, not mixed with
+   feature work."). Left unedited permanently per the strict append-only
+   rule; meaning recoverable from this disclosure.

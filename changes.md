@@ -133,3 +133,72 @@ userinfo (empty username) alone is masked.
   added yet — none are "first required" in Phase 0.
 - Known limitation: no remote is configured; "tracked" means tracked in local
   git.
+
+---
+
+## Tracking addendum — appended 2026-10-18 (owner-directed, append-only)
+
+**Placement convention (owner decision):** from now on, *all* updates to this
+file are added at the very bottom — strictly append-only. Nothing above this
+addendum is ever reworded, moved, or deleted, including entries that predate
+this rule. This supersedes the "newest first" placement note in the
+Maintenance rules section above, which stays as-written for the historical
+record.
+
+### Integrity disclosure #1 — the lost Phase 0 heading
+
+The incident: during the Phase 1 entry insertion (commit `9903795`), the
+section heading `## Phase 0 — Repository and Build Foundation` was
+accidentally destroyed by the edit that inserted the Phase 1 section. The
+heading is the *only* content that was lost.
+
+Everything else survived completely intact: the complete Phase 0 record —
+Date, Commits (`83efc56`), Outcome, the full "Added" file table, the
+"Initialized" section, the verification table, and the scope-control notes —
+is present, unchanged, directly below the Phase 1 section in this file (from
+the line beginning `- **Date:** 2026-10-18` / `**Commits:** 83efc56` on).
+
+The heading belonged directly above that surviving record. Per the strict
+append-only rule it is restored here (for the record) rather than re-inserted
+mid-file:
+
+```
+## Phase 0 — Repository and Build Foundation
+```
+
+Readers: treat the orphaned block between the Phase 1 section and this
+addendum as the Phase 0 record under this restored heading.
+
+### Integrity disclosure #2 — an in-place mutation before this rule
+
+One historical record was reworded in place *before* the append-only rule was
+established, disclosed here so no change to history remains silent:
+
+- Phase 0 "Added" table, `Cargo.toml` row: the parenthetical
+  "(stack CABs deferred to first-use phases)" was typo-corrected in place to
+  "(Stack crates deferred to first-use phases)" during the post-Phase 0
+  documentation commit. Meaning unchanged; capitalization drifted
+  mid-sentence as part of that fix ("Stack" vs "stack"). Left as-is per this
+  rule.
+
+### Phase 1 tracking addendum — missing metadata
+
+The Phase 1 entry above was written without its commit line, violating the
+maintenance rule that every entry carries commit hashes. Recorded here,
+append-only:
+
+- **Commits (Phase 1):**
+  - `9903795` — "Phase 1: CLI shell, configuration, errors, and logging"
+    (15 files changed, 1819 insertions(+), 64 deletions(-); includes
+    `Cargo.lock` with the Phase 1 dependency set)
+  - `826e7f9` — "docs: add changes.md changelog and decision.md ADR; link
+    both from README" (the documentation commit that introduced this file
+    and `decision.md`, between Phases 0 and 1)
+- **Repository state at Phase 1 close:** branch `main`; `Cargo.lock` tracked;
+  canonical verification re-run on a fresh clone per ADR-0008
+  (fmt → clippy → test; 29 unit + 11 integration, all passed on Windows);
+  `AGENTS.md` present but intentionally untracked pending owner instruction.
+
+These addendum entries are part of the Phase 1 tracking record and must be
+read together with it.
+
