@@ -202,3 +202,67 @@ append-only:
 These addendum entries are part of the Phase 1 tracking record and must be
 read together with it.
 
+---
+
+## Interim change — product rename to SwiftFetch (between Phases 1 and 2)
+
+**Date:** 2026-10-18 · **Version:** 0.2.0 → 0.3.0 · **Nature:** owner-directed
+identity change, no feature work (recorded at the bottom per the append-only
+rule above and ADR-0010)
+
+### What happened
+
+The project owner named the product **SwiftFetch** and, when asked whether
+the rename went beyond documentation text, chose the *full* rename: the brand
+also becomes the technical identity. Recorded in full as ADR-0011
+(`decision.md`, addendum #2 below-bottom).
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | Package/binary `download-manager` → `swift-fetch` (kebab-case Rust convention); version 0.2.0 → 0.3.0; description now "SwiftFetch — Windows-first command-line download manager" |
+| `Cargo.lock` | Regenerated: package `swift-fetch` 0.3.0; committed per the standing rule |
+| `src/cli/commands.rs` | clap `name = "SwiftFetch"` (version/help identity), about and long_about now "SwiftFetch — Windows-first command-line download manager." |
+| `src/app/mod.rs` | Unit-test argv[0] placeholders → `"swift-fetch"` (4 sites) |
+| `src/cli/mod.rs` | Unit-test argv[0] placeholders → `"swift-fetch"` (2 sites) |
+| `tests/cli.rs` | `CARGO_BIN_EXE_download-manager` → `CARGO_BIN_EXE_swift-fetch`; version test renamed to `version_reports_program_name_and_version`, now asserts `SwiftFetch`; assertion substance otherwise unchanged |
+
+### Document changes
+
+| File | Change |
+|---|---|
+| `README.md` | Title `# SwiftFetch`; intro sentence names the product; usage example `swift-fetch --help` |
+| `AGENTS.md` | Layout note now says no `swift-fetch/` subfolder (file stays untracked pending the owner's commit decision; disk content renamed) |
+| `DOCS/PRD.md`, `DOCS/architecture.md`, `DOCS/phases.md` | Titles gain a "(SwiftFetch)" suffix |
+| `DOCS/architecture.md` §5 | Layout-tree root label `download-manager/` → `swift-fetch/` |
+| `changes.md`, `decision.md` | Appended only (this entry; ADR-0011). Historical records keep `download-manager` by design — the append-only rule forbids touching them; ADR-0011 is the official name mapping |
+
+Intentionally unchanged: `DOCS/phases.md` line 7 cites the upstream spec
+*filename* `windows-first-cli-download-manager-project.md` (citation, not
+branding); generic descriptive prose such as "Windows-first command-line
+download manager" (description, not name). The Phase 1 CLI contract —
+commands (`download`/`status`/`resume`/`retry`), options, exit codes, help
+honesty — is unchanged except for the program name.
+
+### Verification (rename commit `56e7501`)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | Pass, after applying one mechanical re-wrap (the shorter identifier moved three rustfmt line breaks; no semantic change) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Pass (`swift-fetch v0.3.0`, zero warnings) |
+| `cargo test` | Pass: 29 unit + 11 integration = 40/40, including the real-binary test asserting the version output contains `SwiftFetch` |
+| Binary smoke | `swift-fetch --version` → `SwiftFetch 0.3.0`; `--help` → branded about text and `Usage:` line |
+| Windows honesty | Built, formatted, linted, and tested on Windows MSVC (rustc 1.99.1); every check ran on Windows |
+
+### Scope-control notes
+
+- Owner-directed interim change between phases; it is **not** part of any
+  phase's task list, and Phase 2 remains unstarted pending explicit
+  instruction.
+- No new dependencies; the deferred stack (Tokio, Reqwest, SQLite, ZIP,
+  serde, url) is untouched.
+- `AGENTS.md` is still untracked; only its identifier reference was renamed
+  (its stale "Currently docs-only" status line remains as the owner left it).
+
+

@@ -389,3 +389,61 @@ this rule.
    `Cargo.lock`/target state; do it in a dedicated commit, not mixed with
    feature work."). Left unedited permanently per the strict append-only
    rule; meaning recoverable from this disclosure.
+
+---
+
+## Tracking addendum #2 — appended 2026-10-18 (SwiftFetch rename)
+
+### ADR-0011 — Product identity "SwiftFetch" (owner-directed rename)
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** The owner directed "put name as SwiftFetch in all comments /
+  documents everywhere" and, asked whether that included the technical
+  identity, chose the *full* rename. The change lands between Phase 1 and
+  Phase 2 — the cheapest possible moment: the CLI surface exists, the engine
+  is absent, there are no users and no release to break.
+- **Decision:**
+  1. Display/product name: **SwiftFetch** — README title and intro, cargo
+     `description`, clap `name` (help/version identity), about text.
+  2. Crate/binary identifier: **swift-fetch** (Rust kebab-case convention) —
+     package name, binary `swift-fetch.exe`, `CARGO_BIN_EXE_swift-fetch` in
+     integration tests, and the `Cargo.lock` package entry.
+  3. Version 0.2.0 → 0.3.0 (pre-1.0 minor bump: the binary name users invoke
+     is user-visible).
+  4. DOCS titles gain a "(SwiftFetch)" suffix; generic descriptive prose
+     ("Windows-first CLI download manager") stays — it describes the
+     product, it does not name it. The `DOCS/phases.md` citation of the
+     upstream spec *filename* `windows-first-cli-download-manager-project.md`
+     stays unchanged (citing a filename is not branding).
+  5. The Phase 1 CLI contract surface is unchanged — commands, options,
+     exit codes, and help honesty all stand; only the program name changes.
+- **Alternatives considered:**
+  1. Exact-case crate name `SwiftFetch` — rejected: lowercase kebab-case is
+     the Rust ecosystem convention and avoids tooling surprises around
+     case-sensitive identifiers on Windows and in CI.
+  2. Text-only branding (identifiers stay `download-manager`) — rejected by
+     the owner: incoherent identity, where docs say SwiftFetch while users
+     type download-manager.exe.
+  3. Rename without a version bump — rejected: 0.3.0 marks the observable
+     identity change in the pre-1.0 sequence (Phase 1 was 0.2.0).
+- **Tradeoffs:** Two coexisting forms — **SwiftFetch** (display) and
+  **swift-fetch** (crate/binary/env var) — because Rust identifiers are
+  conventionally lowercase-kebab and cannot carry the brand's casing; this
+  record is the mapping. Historical `changes.md` records keep
+  `download-manager` (append-only rule, ADR-0010) and are mapped through
+  this ADR. `Cargo.lock` refreshed automatically on the first post-rename
+  build and was committed with the rename per the standing rule.
+- **Related:** ADR-0010 (append-only tracking rule), ADR-0001 (single crate
+  at the repo root), ADR-0009 (Phase 1 CLI contract; surface unchanged).
+
+### Addendum-index extension (ADR-0011 row; the frozen top index stays untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0011 | Product identity "SwiftFetch" (owner-directed rename) | Accepted |
+
+Commit record: rename commit `56e7501` — "rename: product SwiftFetch; crate
+download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
+41 deletions, including the regenerated `Cargo.lock`).
+
