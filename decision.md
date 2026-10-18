@@ -447,3 +447,54 @@ Commit record: rename commit `56e7501` — "rename: product SwiftFetch; crate
 download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 41 deletions, including the regenerated `Cargo.lock`).
 
+---
+
+## Tracking addendum #3 — appended 2026-10-18 (remote + first push, owner-directed)
+
+### ADR-0012 — Public remote repository and first push (owner-directed)
+
+- **Status:** Accepted (supersedes the *local-only* aspect of ADR-0002; the
+  ADR-0002 text remains byte-for-byte as written per ADR-0010)
+- **Date:** 2026-10-18
+- **Context:** The owner instructed, in exact order: update `.gitignore`
+  against unwanted files/build artifacts, stage everything with
+  `git add -A`, commit once descriptively, and push to
+  `https://github.com/NYN-05/SwiftFetch.git`. This ends the intentional
+  local-only state adopted in ADR-0002 and also settles `AGENTS.md` tracking
+  (previously deferred pending an owner decision).
+- **Decision:**
+  1. `.gitignore` keeps `/target` and `*.tmp` and gains preventive patterns
+     (`*.bak`, `*.rs.bk`, `Thumbs.db`, `Desktop.ini`, `.DS_Store`,
+     `.env`, `.vscode/`); no tracked file matches any pattern, so no history
+     rewrite is involved.
+  2. `AGENTS.md` becomes tracked via `git add -A` per the owner's
+     instruction, committed as written despite its stale status line.
+  3. Remote `origin` points at the SwiftFetch GitHub URL; the first push
+     sends `main` with the full history (Phase 0 through the SwiftFetch
+     rename) — no squash, no re-init.
+- **Alternatives considered:**
+  1. Squash/re-init history before the first push for a "clean" remote start
+     — rejected: the append-only tracking history *is* the project's record;
+     hiding it would contradict the owner's own append-only policy and the
+     Phase 0-heading recovery disclosures.
+  2. Never commit `AGENTS.md` — rejected by the owner's `add -A`.
+  3. Branch-per-push or mirrored feature branches — rejected: a single
+     `main` mirrors the local branch policy from ADR-0002.
+- **Tradeoffs:** The pre-release history becomes externally visible as-is,
+  including the honest incident disclosures (Phase 0 heading restoration,
+  in-place mutation disclosures). The remote repository name encodes the
+  brand (`NYN-05/SwiftFetch`), locking the identity to GitHub's naming
+  (uppercase retained there, while the crate stays kebab-case — see
+  ADR-0011). No secrets exist in the tree; `.env` is newly ignored as
+  preventive hardening.
+- **Related:** ADR-0002 (git init; remote aspect superseded here),
+  ADR-0008 (verification recipe unchanged), ADR-0010 (append-only rule),
+  ADR-0011 (product identity matching the remote name).
+
+### Addendum-index extension (ADR-0012 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0012 | Public remote repository and first push (owner-directed) | Accepted |
+
+

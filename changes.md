@@ -265,4 +265,38 @@ honesty — is unchanged except for the program name.
 - `AGENTS.md` is still untracked; only its identifier reference was renamed
   (its stale "Currently docs-only" status line remains as the owner left it).
 
+---
+
+## Git operations — .gitignore hardening, remote setup, first push (between Phases 1 and 2)
+
+**Date:** 2026-10-18 · **Nature:** owner-directed repository/infrastructure
+change; no product code affected
+
+### What happened
+
+1. **`.gitignore` updated.** The existing `/target` and `*.tmp` rules are
+   kept verbatim; added backup-file patterns (`*.bak`, `*.rs.bk`), OS noise
+   (`Thumbs.db`, `Desktop.ini`, `.DS_Store`), and local-only configuration
+   (`.env`, `.vscode/`). Build artifacts and scratch files can no longer be
+   staged accidentally. `Cargo.lock` remains intentionally tracked (stack
+   rule); it does not match any ignore pattern. Verified before staging:
+   no already-tracked file matches any new pattern, so no `git rm --cached`
+   was needed.
+2. **`AGENTS.md` enters version control.** The owner's explicit
+   `git add -A` instruction settles the previously open "commit or not"
+   question in favor of tracking. The file is committed exactly as written
+   — including its stale "Currently docs-only" status line — under the
+   append-only discipline; the agent does not rewrite owner prose.
+3. **Remote + first push.** Remote `origin` =
+   `https://github.com/NYN-05/SwiftFetch.git`; `main` was pushed upstream
+   with `git push -u origin main`, shipping the complete history from
+   Phase 0 onward. Recorded as **ADR-0012** (`decision.md`), which
+   supersedes the local-only stance of ADR-0002 *via a new appended record*,
+   never by editing the old record (ADR-0010 policy).
+
+Honesty note: this entry and ADR-0012 are part of the same single commit
+they describe, so they cannot carry that commit's hash in-file; the hash is
+recorded in the git log on `origin/main` immediately after the push.
+
+
 

@@ -1,2 +1,18 @@
+# Rust build artifacts (never committed)
 /target
+
+# Cargo.lock is intentionally tracked (stack rule: commit the lockfile)
+
+# Scratch, temporary, and backup files
 *.tmp
+*.bak
+*.rs.bk
+
+# OS noise (Windows-first; others for cross-machine safety)
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local-only configuration
+.env
+.vscode/
