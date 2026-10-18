@@ -527,5 +527,23 @@ Phase 2 dev-dependencies are shared, never leaked into the product build.
   rustc 1.99.1); nothing in this phase was verified on another platform,
   and nothing was presented as Windows proof that wasn't.
 
+### Phase 3 verification addendum (post-commit, appended 2026-10-18)
+
+- **Commit:** `f231176` - "Phase 3: HTTP client and resource probing
+  (v0.5.0)" (code + tests + tracking files, 13 files changed,
+  3058 insertions(+), 70 deletions(-)). The phase entry above is part of
+  that commit, so the hash is recorded here and in `git log`, not inside
+  the entry itself (same honesty rule as the Phase 1/2 entries).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `f231176` to a fresh temp directory on Windows, working tree verified
+  clean, recipe run in order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
+| `cargo test` | 124 passed (74 unit + 11 cli + 15 fixtures + 24 mock_server), 0 failed |
+
+
 
 
