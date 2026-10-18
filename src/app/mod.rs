@@ -5,6 +5,7 @@
 //! not-implemented error instead of fabricating success. Wiring happens
 //! phase by phase (`DOCS/phases.md`).
 
+pub(crate) mod batch;
 mod commands_handler;
 
 use crate::cli::{Cli, Commands};

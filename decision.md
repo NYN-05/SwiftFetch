@@ -1061,5 +1061,123 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0019 | Phase 6 resume protocol: plan-before-network recovery, min() trust rule, revalidated append-or-restart, bounded retries, graceful shutdown parking | Accepted |
 
+## ADR-0020 - Phase 7 batch layer: acceptance-time queue records, provisional-name refresh, adoption-not-duplication, and the bounded worker pool
+
+- **Status:** Accepted
+- **Date:** 2026-10-19
+- **Context:** Phase 7 adds URL batches (one URL, several URLs, a URL-list
+  file) with bounded concurrent file scheduling on top of the Phase 6
+  persisted engine, while commands remain unwired until Phase 11. The hard
+  constraints: queue work must be persistent and bounded (no task or buffer
+  per URL); one download's failure must never touch another's record;
+  restarts must find unfinished work resumable; and the record's name must
+  obey ADR-0016 (sanitized effective-URL names) even though a queued record
+  is created *before* any probe can know the effective URL. The engine
+  refuses two unfinished records for one scope (ADR-0019), so a naive
+  "insert one record per input line" design would break its own restart
+  path.
+- **Decision:**
+  - **Acceptance is validation-first, all-or-nothing.** Inline URLs are
+    validated and normalized through the URL parser. A list file is
+    processed in two passes: the first scans every line to validate it and
+    count usable URLs (any malformed line refuses the whole submission,
+    naming the file and the 1-based line); only then does the second pass
+    stream the file to enqueue. Text rules: blank/whitespace-only lines
+    and `#`-comment lines are skipped, a UTF-8 BOM is tolerated on the
+    first line, and every other line must parse as an HTTP/HTTPS URL.
+    A blank/comment-only file and an empty submission are typed `Input`
+    refusals.
+  - **Normalization is the parser's canonical form** (`Url::to_string()`),
+    and it is the URL text stored in records and passed to the engine, so
+    scope matching across invocations is textual and stable. Fragments are
+    kept (they are part of the submission identity; HTTP never sends
+    them).
+  - **Queue before network, one record per unique URL.** The producer
+    inserts a `queued` record for every accepted URL whose scope has no
+    record (provisional name from the *requested* URL), adopts the single
+    unfinished record when one exists (restart continuation), schedules a
+    completed scope without inserting (idempotent no-op / the engine's
+    own missing-file refusal), and refuses `2+` unfinished records with
+    the engine's exact multiplicity error as a per-download outcome.
+    Duplicates within one invocation collapse onto the first occurrence
+    (logged, never silently re-downloaded).
+  - **Provisional-name refresh (ADR-0016 preserved).** A *pristine* record
+    (no confirmed facts, no engine-owned partial) has its `file_name` and
+    `destination` refreshed together in one transaction from the effective
+    URL after the first probe; any record with facts or a partial keeps
+    its recorded name forever (the partial file is named after it). The
+    refresh is engine-side (`Fresh { record: Some }` branch, via the
+    repository's `set_planned_name`), so both the batch flow and any
+    direct engine caller get it.
+  - **Bounded worker pool.** Exactly `min(max_concurrent_files, submitted
+    URLs)` worker tasks (never one task per URL) pull `WorkItem`s from a
+    bounded channel (`worker_count * 2` capacity); one producer task
+    streams inputs and writes records; a results channel (same capacity)
+    carries outcomes to the drain loop in completion order. Bounded
+    channels apply backpressure; a large list is never buffered whole. The
+    scheduler owns an `ActiveGauge` (RAII-guarded, relaxed atomics) whose
+    peak is reported: `peak_active_files <= max_concurrent_files` is
+    observable, not asserted by construction alone.
+  - **Independent failures.** Every download's error is its own outcome
+    (`Completed` / `Failed{category, message}` / `Interrupted`); the
+    record carries the state. Hard `Err` is reserved for input refusal,
+    list-file IO, database failures, and worker/producer panics (mapped to
+    `Database` with an honest "this is a bug" message - the taxonomy has
+    no internal category). Worker failure logs name only the redacted URL
+    and the category; the full message stays in the outcome for Phase 11.
+  - **Shutdown semantics.** A tripped `ShutdownHandle` stops the producer
+    from accepting further input (a pre-tripped signal accepts nothing;
+    the report is empty) and stops workers from *starting* transfers;
+    in-flight transfers park through the ADR-0019 path. Never-started
+    entries stay `queued`; interrupted streams park `paused` - the
+    report says `Interrupted` for both, and the database is the source of
+    the finer distinction. A rerun adopts every unfinished record and
+    completes it without duplicating anything.
+- **Alternatives considered:**
+  1. **Insert one record per input line, no adoption** - rejected: it
+     trips the engine's two-unfinished-records-per-scope refusal on the
+     first rerun; adoption is what makes reruns idempotent.
+  2. **No records until a worker starts (probe-first like the engine's
+     fresh flow)** - rejected: the phase requires persistent queue
+     records for accepted downloads; unstarted work would be invisible
+     to `status` and lost to a crash.
+  3. **Name queued records from the effective URL by probing at
+     acceptance** - rejected: acceptance must not need the network, and
+     serializing probes through the producer would defeat the
+     concurrency the phase asks for.
+  4. **Keep the provisional requested-URL name forever** - rejected:
+     ADR-0016 says effective-URL names; a redirecting URL would
+     finalize under the redirector's name, diverging from the engine's
+     own fresh flow.
+  5. **Spawn a task per work item with a semaphore** - rejected:
+     unbounded task count for unbounded input; a fixed pool over a
+     bounded channel is the strongest bound for the same concurrency.
+  6. **Let conflicted scopes hard-fail the whole submission** -
+     rejected: contradicts per-download independence; the conflict is
+     reported in the conflicted URL's outcome while the rest proceed.
+- **Consequences:**
+  - The batch is the Phase 11 command layer's engine: `run_batch(client,
+    repo, BatchRequest, output_dir, max_concurrent_files, &RetryPolicy,
+    &ShutdownHandle, now) -> Result<BatchReport, AppError>`.
+  - Write economy: a fresh scope's download costs one provisional record
+    write; the refresh only writes when the name actually changed.
+    Adoption means reruns of unchanged command lines converge to
+    completion instead of accumulating records.
+  - The report is completion-ordered data; user-facing summaries,
+    progress rendering, exit codes, and redaction belong to Phase 11.
+  - Scope truth stays one definition: the batch snapshots scopes once
+    (same url-text + `destination.parent()` rule as `plan_for`) and shares
+    `RECOVERABLE` and the multiplicity error with the engine so the two
+    can never drift.
+- **Related:** ADR-0016 (naming/finalization), ADR-0018 (lifecycle
+  graph), ADR-0019 (resume protocol), `DOCS/phases.md` Phase 7,
+  `changes.md` Phase 7 entry.
+
+### Addendum-index extension (ADR-0020 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0020 | Phase 7 batch layer: acceptance-time queue records, provisional-name refresh, adoption-not-duplication, and the bounded worker pool | Accepted |
+
 
 

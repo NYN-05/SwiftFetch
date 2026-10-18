@@ -90,6 +90,11 @@ impl Default for HttpTimeouts {
 /// All engine network operations must run through an instance of this
 /// wrapper, never through a fresh `reqwest::Client`, so connection reuse
 /// and timeout policy stay consistent.
+///
+/// Cloning shares the one underlying `reqwest::Client` (its connection
+/// pool included): that is how the Phase 7 batch hands the same configured
+/// client to every worker task without building another one.
+#[derive(Clone)]
 pub(crate) struct HttpClient {
     client: reqwest::Client,
     timeouts: HttpTimeouts,

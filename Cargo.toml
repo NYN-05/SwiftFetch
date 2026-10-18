@@ -1,6 +1,6 @@
 [package]
 name = "swift-fetch"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
@@ -19,9 +19,15 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 bytes = "1"
 # Phase 4: the sequential transfer engine is async production code — bounded
 # transfer timeouts (time), partial-file streaming (fs, io-util). Phase 6 adds
-# "sync" for the graceful-shutdown watch channel behind the shutdown handle.
+# "sync" for the graceful-shutdown watch channel behind the shutdown handle
+# (and the batch scheduler's bounded channels) — and "macros": resume.rs's
+# `tokio::select!` races shutdown and body reads in production code; a plain
+# `cargo build` only ever compiled because the gate recipe's `--all-targets`
+# unified the dev-dependencies' features in (a latent Phase 6 gap pinned here
+# so the product feature set is honest on its own). Phase 7 adds "rt": the
+# file scheduler spawns a fixed pool of worker tasks and a producer task.
 # Runtime bootstrap features stay in later phases per first-use (ADR-0003).
-tokio = { version = "1", default-features = false, features = ["fs", "io-util", "time", "sync"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "time", "sync", "macros", "rt"] }
 # Phase 5: SQLite queue/recovery metadata (architecture §9). "bundled"
 # compiles the SQLite engine itself, so no system SQLite library is needed
 # and Windows behavior is reproducible; metadata only — the database never

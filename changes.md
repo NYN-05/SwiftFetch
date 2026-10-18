@@ -1113,6 +1113,175 @@ storage::schema 8 (Phase 5 baseline 134 → 178).
 | `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 29.3 s check) |
 | `cargo test` | 228 passed, 0 failed (178 unit + 11 cli + 15 fixtures + 24 mock_server), identical to the working-tree run (unit target 177.9 s cold) |
 
+## Phase 7 - URL Batches and Bounded Concurrent File Scheduling
+
+- **Date:** 2026-10-19
+- **Version:** `0.8.0` → `0.9.0`
+- **Outcome:** Phase 7 exit gate met (working tree). A new batch layer
+  (`src/app/batch.rs`) turns one URL, several inline URLs, or a URL-list
+  file into persistent queue records and drives them through a bounded
+  worker pool on top of the Phase 6 persisted engine. Every accepted URL
+  is queued *before* any network work (provisional name derived from the
+  requested URL); each scope owns exactly one record - inserted, adopted,
+  or idempotently rescheduled, never duplicated; duplicates inside one
+  submission collapse onto their first occurrence; per-download failures
+  stay independent; and a graceful shutdown stops acceptance and transfer
+  starts while leaving every unfinished record resumable. Scheduling is
+  `min(max_concurrent_files, submitted URLs)` worker tasks over bounded
+  channels with an observed `peak_active_files`; the 600-URL regression
+  runs under a limit of 4 with the peak inside `2..=4` and exactly 600
+  terminal records. The engine gained the piece queue-before-network
+  needs: a *pristine* queued record (no facts, no partial) refreshes its
+  planned name and destination from the effective URL on its first probe
+  (ADR-0020), so ADR-0016 naming still holds end to end - a submission to
+  the redirecting `/moved` finalizes as `real-file.bin` while the
+  provisional name never materializes. The CLI is untouched and still
+  honestly not-implemented; Phase 11 wires it.
+- **Dependency and feature changes (approved stack, in-place):** no new
+  crates; `tokio`'s product features gained `macros` and `rt`. `rt` is
+  Phase 7's first-use need (the worker pool and producer are production
+  `tokio::spawn`/`JoinSet` call sites). `macros` closes a latent Phase 6
+  gap: `resume.rs` uses `tokio::select!` in production code, but the
+  committed product feature set did not carry the feature - a plain
+  `cargo build` failed on `d38f881`, while the canonical gate recipe
+  passed because `--all-targets` unifies dev-dependency features
+  (`macros`, `rt-multi-thread`). Both are pinned in the product set now
+  and plain `cargo build` is verified green (disclosed rather than
+  quietly fixed; the canonical recipe's results are unchanged).
+- **Code changes**
+
+| File | Change |
+|---|---|
+| `src/app/batch.rs` (new, 1772 lines) | The Phase 7 batch layer. Acceptance: inline validation + two-pass list-file validation (all-or-nothing; a malformed line refuses the whole submission naming file and 1-based line; blank/`#`-comment lines skipped; BOM tolerated; empty submission/file refused as `Input`), canonical-form normalization, per-invocation dedupe (first occurrence wins, logged). Scheduling: queue-before-network producer (insert a `queued` record with provisional name / adopt the one unfinished record / reschedule a completed scope / refuse `2+` unfinished with the engine's exact multiplicity error as that download's outcome), bounded worker pool with claim-by-lock on a shared receiver, `ActiveGauge`/`ActiveGuard` peak tracking, outcome drain in completion order, shutdown semantics, `BatchReport`. 23 tests. |
+| `src/download/resume.rs` | `RECOVERABLE` and the unresolved-multiplicity error are now shared with the batch (`pub(crate)` / `unresolved_multiplicity_error(record_ids, url, output_dir)`, factored out of `plan_for`) so the two layers cannot drift; `Fresh { record: Some }` refreshes a pristine record's `file_name` + `destination` from the effective URL after the first probe (`is_pristine` + repository transaction). 3 new tests lock pristine refresh, facts-pinned names, and engine-owned-partial-pinned names. |
+| `src/storage/repository.rs` | `set_planned_name(id, file_name, destination, timestamp)` - both columns move together in one transaction, `not_found` on zero rows; 1 test. |
+| `src/download/http.rs` | `#[derive(Clone)]` on `HttpClient`: clones share the one configured `reqwest::Client` (connection pool included) - how every worker gets the same client without building another; doc note added. |
+| `src/app/mod.rs` | declares `pub(crate) mod batch;`. |
+| `Cargo.toml` / `Cargo.lock` | version `0.9.0`; tokio features per the section above (lock: version line only). |
+| `decision.md` | ADR-0020 + its addendum-index row. |
+
+- **Defects caught before commit (recorded honestly)**
+  1. Empty-submission guard: the first version required
+     `inline.is_empty() && file_count == Some(0)`, which never fires when
+     no URL file is given (`file_count == None`), so a default request ran
+     an empty no-op batch instead of refusing. `an_empty_submission_is_
+     refused` caught it on the first full-suite run; the guard now
+     requires at least one URL from either source, and the module suite
+     re-ran green.
+  2. Latent product-build gap (Phase 6): plain `cargo build` failed on the
+     committed `d38f881` because production `tokio::select!` needs
+     `macros`; found by this phase's first build check (the canonical
+     recipe hides it via dev-dependency feature unification). Pinned with
+     the `rt` addition; plain `cargo build` re-verified.
+  3. Test timing math: the mock's `delay_body_ms` sleeps between 512-byte
+     frames (7 waits per 4 KiB fixture), so the concurrency floor first
+     written (500 ms) could not separate "three waves" (~4.2 s) from an
+     unbounded scheduler (~1.4 s) or a three-worker bug (~2.8 s); the
+     floor is now 3200 ms, and the restart test's 700 ms body delays were
+     reduced to 250 ms (trip window still ~25x the 10 ms poll interval)
+     purely for wall-clock economy.
+  4. Mechanical lint repairs along the way: `cloned_ref_to_slice_refs` at
+     four test sites (`std::slice::from_ref`), the eight-parameter entry's
+     narrow `#[allow(clippy::too_many_arguments)]` (same pattern as
+     `transfer_persisted`), and a test-only import moved out of the
+     production import list.
+- **Behavior contract (Phase 7)**
+  - **Acceptance law.** Validation happens before anything is queued or
+    fetched, and it is all-or-nothing: a bad inline URL or one malformed
+    list-file line refuses the submission naming the file and 1-based
+    line (inline refusals name the offending URL); blank/whitespace-only
+    and `#`-comment lines are not URLs; a UTF-8 BOM on line 1 is
+    tolerated; an empty submission or a file with no URLs is `Input`
+    ("...contains no URLs"; blank lines and `#`-comment lines are
+    ignored). List files are read twice: validate + count first, then
+    stream-and-enqueue.
+  - **Identity law.** The stored URL text is the parser's canonical form
+    (`Url::to_string()`, fragment included), which is also what the
+    engine receives - scope matching is textual and stable across
+    invocations. Duplicates within one invocation collapse onto the first
+    occurrence (info-logged with the redacted URL).
+  - **Queue law.** Every accepted URL owns exactly one record before its
+    first byte of network work: a fresh scope inserts a `queued` record
+    (provisional requested-URL name); a scope with exactly one unfinished
+    record is adopted without inserting; a completed scope is
+    rescheduled (the engine then reports completion or its own
+    missing-file refusal); a scope with 2+ unfinished records gets a
+    per-download `Failed {Input}` carrying the engine's exact multiplicity
+    message.
+  - **Naming law.** Provisional names are sanitized requested-URL names;
+    a pristine record (no facts, no partial) refreshes name + destination
+    from the effective URL at its first probe (ADR-0016/ADR-0020); a
+    record with confirmed facts or an engine-owned partial keeps its
+    recorded name forever.
+  - **Bounded law.** Worker tasks = `min(max_concurrent_files, submitted
+    URLs)`; work and result channels are bounded (`worker_count * 2`);
+    the shared receiver lock is held only while claiming; no task,
+    buffer, or network work exists per unstarted URL. `peak_active_files`
+    is measured around active transfers via an RAII guard.
+  - **Independence law.** A download's failure touches only its own
+    record and outcome (`Completed` / `Failed {category, message}` /
+    `Interrupted`); hard `Err` is reserved for input refusal, list-file
+    IO, database failures, and worker/producer panics (the latter typed
+    `Database` with a "this is a bug" message - no internal category
+    exists). Worker failure logs carry only the redacted URL and
+    category; the full message rides the outcome for Phase 11.
+  - **Shutdown law.** A pre-tripped signal accepts nothing (empty
+    report); a trip stops the producer from accepting the next URL and
+    stops workers from starting transfers; in-flight streams park per
+    ADR-0019 (record `paused`, partial preserved); never-started entries
+    stay `queued`. Either way the outcome is `Interrupted` and a later
+    invocation adopts and completes the records.
+  - **CLI law.** Unchanged: commands still print the honest
+    not-implemented error and exit 1; the batch layer has no production
+    caller until Phase 11, so it carries the sanctioned
+    `#[allow(dead_code)]` waiver naming that phase.
+- **Verification - actual results (all run on Windows)**
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
+| `cargo test` | **255 passed, 0 failed** = 205 unit + 11 cli + 15 fixtures + 24 mock_server (unit run 145.4 s; cli 2.2 s; fixtures 0.0 s; mock_server 2.0 s) |
+| `cargo build` (extra, plain product build) | pass - the pinned feature set makes the product build standalone-green |
+
+Observed per-module unit counts (`--list`): app 26 (3 dispatch + 23
+batch), cli 9, common::fixture 6, config 7, download 110 (http 5, probe
+37, progress 2, resume 30, retry 11, sequential 25), error 5, logging 5,
+storage 37 (file_writer 9, repository 20, schema 8). Phase 6 baseline
+178 → 205 unit tests.
+
+- The CLI behavior contract is untouched and still locked by its Phase 1
+  tests (11 passed).
+- The ADR-0014 double-count disclosure still applies: the six common
+  fixture inline tests run in multiple targets.
+- Disclosed limitations, honest for this phase: the batch layer has no
+  production caller yet (Phase 11 wires commands and finalizes
+  user-facing URL syntax, summaries, and exit codes; queue-record
+  visibility for a `status` view is proved here through a second
+  `Repository` opening the same WAL database, since the command itself
+  stays unwired); the bounded-resource evidence is structural (pool =
+  min(limit, inputs), bounded channels, gauge peak) plus the wave-floor
+  timing check, not an RSS measurement - the 600-URL test proves one
+  terminal record per URL and a bounded peak, not a memory ceiling; the
+  mock's `with_status` override answers probe HEAD and transfer GET alike
+  (route-level), which is the semantics these tests rely on; the Phase 6
+  disclosures (mock truncation = clean mid-body EOF; the unreachable
+  "206 answering a rangeless request" law) still stand.
+- Windows honesty: every check ran on Windows (MSVC, rustc 1.99.1),
+  including the naming/destination paths the batch exercises; nothing in
+  Phase 7 ran on another platform.
+- **Scope-control notes**
+  - No segmented (multi-connection, per-segment) scheduling, no
+    pause/resume command wiring, no extraction, no GUI, no telemetry -
+    their phases per `DOCS/phases.md`.
+  - No new crates; the runtime feature additions are the two pinned above
+    with the phase that first needs them (ADR-0003); the single shared
+    `reqwest::Client` still comes from `HttpClient`.
+  - Tracking files: both appends observe ADR-0010 (append-only at the
+    very bottom). The phase commit cannot know its own hash, so the hash
+    and the fresh-clone gate results land in the post-commit addendum
+    below - the same rule as Phases 1-6.
+
 
 
 

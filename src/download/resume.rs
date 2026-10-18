@@ -65,7 +65,12 @@ use crate::storage::repository::{
 };
 
 /// Statuses from which a record can still be driven to completion.
-const RECOVERABLE: [DownloadState; 6] = [
+///
+/// Public within the crate because the Phase 7 batch scheduler decides
+/// identically which of a scope's records are unfinished when it adopts a
+/// submitted URL instead of duplicating it (`src/app/batch.rs`); the two
+/// definitions must stay one.
+pub(crate) const RECOVERABLE: [DownloadState; 6] = [
     DownloadState::Queued,
     DownloadState::Probing,
     DownloadState::Downloading,
@@ -410,16 +415,41 @@ async fn run_attempt(ctx: &Attempt<'_>, plan: RecoveryPlan) -> Result<AttemptOut
             // A restart has nothing to protect: no validator is sent, the
             // current remote is the truth, and the statuses walk first so
             // every failure below reports from `downloading`.
+            //
+            // A *pristine* record (Phase 7: queued at acceptance, never
+            // probed) is the one exception to "the recorded name stands":
+            // it exists before any probe could learn the redirect target,
+            // so its planned name comes from the requested URL; the first
+            // probe refreshes name and destination from the effective URL
+            // (ADR-0016 naming, ADR-0020 pristine refresh).
+            let pristine = is_pristine(&record, partial.as_deref());
             walk_to_downloading(ctx.repo, record.id, record.status, ctx.now)?;
             let facts = probe(ctx.client, ctx.url).await?;
+            let effective_url = validate_url(&facts.effective_url)?;
+            let file_name = if pristine {
+                let name = select_filename(&effective_url);
+                let planned = ctx.output_dir.join(&name);
+                if name != record.file_name || planned != record.destination {
+                    tracing::debug!(
+                        "download record {}: the pristine planned name ({}) is refreshed \
+                         to the effective URL's name ({name})",
+                        record.id,
+                        record.file_name,
+                    );
+                    ctx.repo
+                        .set_planned_name(record.id, &name, &planned, (ctx.now)())?;
+                }
+                name
+            } else {
+                record.file_name
+            };
             ctx.repo
                 .update_transfer_facts(record.id, &probe_facts(&facts), (ctx.now)())?;
-            let effective_url = validate_url(&facts.effective_url)?;
             let redacted = redact_url(&facts.effective_url);
             full_transfer(
                 ctx,
                 record.id,
-                record.file_name,
+                file_name,
                 effective_url,
                 redacted,
                 &facts,
@@ -661,6 +691,34 @@ fn park_retrying(
     Ok(())
 }
 
+/// The refusal for one scope claimed by several unfinished records: the
+/// engine plans against exactly one, and the Phase 7 batch scheduler
+/// rejects the conflicting URL with this same message instead of guessing.
+///
+/// The message names the URL raw (it is the caller's own argument, shown
+/// on the user's terminal, never sent to tracing — log sites redact).
+pub(crate) fn unresolved_multiplicity_error(
+    record_ids: &[i64],
+    url: &str,
+    output_dir: &Path,
+) -> AppError {
+    let ids = record_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    AppError::new(
+        ErrorCategory::Input,
+        format!(
+            "the database holds {} unfinished downloads for {url} in {}: records \
+             ({ids}) cannot share one destination plan; resolve the multiplicity \
+             before the transfer",
+            record_ids.len(),
+            output_dir.display(),
+        ),
+    )
+}
+
 /// Decides what can be safely done with the passed URL + directory from
 /// the database and the disk alone.
 ///
@@ -694,21 +752,8 @@ pub(crate) fn plan_for(
         [] => {}
         [record] => return reconcile_download(repo, record.clone()),
         many => {
-            let ids = many
-                .iter()
-                .map(|record| record.id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(AppError::new(
-                ErrorCategory::Input,
-                format!(
-                    "the database holds {} unfinished downloads for {url} in {}: records \
-                     ({ids}) cannot share one destination plan; resolve the multiplicity \
-                     before the transfer",
-                    many.len(),
-                    output_dir.display(),
-                ),
-            ));
+            let ids = many.iter().map(|record| record.id).collect::<Vec<_>>();
+            return Err(unresolved_multiplicity_error(&ids, url, output_dir));
         }
     }
 
@@ -1026,6 +1071,22 @@ fn probe_facts(facts: &ProbeResult) -> TransferFacts {
         etag: facts.etag.clone(),
         last_modified: facts.last_modified.clone(),
     }
+}
+
+/// Whether a record has never been probed and owns nothing on disk — the
+/// only state in which its planned name is still provisional.
+///
+/// Phase 7 queues records at acceptance time, before any probe can learn
+/// the redirect target, so such a record's name derives from the requested
+/// URL. Facts or an engine-owned partial file mean an earlier attempt made
+/// the name real (the partial file is named after it), and then the name
+/// must never change under the same record (`DOCS/decision.md` ADR-0020).
+fn is_pristine(record: &DownloadRecord, partial: Option<&Path>) -> bool {
+    partial.is_none()
+        && record.effective_url.is_none()
+        && record.expected_size.is_none()
+        && record.etag.is_none()
+        && record.last_modified.is_none()
 }
 
 /// The plain (unranged) fetch path: validate a full-content response, then
@@ -2939,6 +3000,119 @@ mod tests {
             if_range_header(&server, "/unvalidated.bin"),
             None,
             "no conditional request may ever carry an invented validator"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The pristine refresh (Phase 7, ADR-0020): a queued record that was
+    // never probed and owns nothing on disk takes its planned name from the
+    // effective URL; facts or a partial file pin the recorded name instead.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_pristine_queued_record_takes_its_name_from_the_effective_url() {
+        let server = MockServer::start().await;
+        server.mount_route("/effective-name.bin", Behavior::default());
+        let fixture = Fixture::default();
+        let (scratch, repo) = scratch_repo("pristine-name");
+        let dir = scratch.path().to_owned();
+        let url = server.url("/effective-name.bin");
+        let id = repo
+            .insert_download(
+                NewDownload {
+                    url: url.clone(),
+                    destination: dir.join("provisional.bin"),
+                    file_name: "provisional.bin".to_owned(),
+                },
+                test_clock(),
+            )
+            .expect("queued record inserted");
+
+        let download = drive(&repo, &server, "/effective-name.bin", &dir, 0)
+            .await
+            .expect("the queued download runs");
+        assert_eq!(download.file_name, "effective-name.bin");
+        assert_eq!(download.destination, dir.join("effective-name.bin"));
+        assert_eq!(download.bytes_written, fixture.len);
+
+        let record = repo.get_download(id).expect("read back").expect("present");
+        assert_eq!(record.status, DownloadState::Completed);
+        assert_eq!(
+            record.file_name, "effective-name.bin",
+            "the provisional name is refreshed to the effective URL's name"
+        );
+        assert_eq!(record.destination, dir.join("effective-name.bin"));
+        assert!(
+            !dir.join("provisional.bin").exists(),
+            "the provisional name never materializes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_with_confirmed_facts_keeps_its_recorded_name() {
+        let server = MockServer::start().await;
+        server.mount_route("/kept-name.bin", Behavior::default());
+        let fixture = Fixture::default();
+        let (scratch, repo) = scratch_repo("pinned-facts");
+        let dir = scratch.path().to_owned();
+        // Every field matches the route, yet the planned name deliberately
+        // differs: facts mean an earlier attempt made the name real, so it
+        // must survive the restart (ADR-0020).
+        let id = seeded_downloading_record(
+            &repo,
+            &dir,
+            &server.url("/kept-name.bin"),
+            "pinned.bin",
+            Some(fixture.len),
+        );
+
+        let download = drive(&repo, &server, "/kept-name.bin", &dir, 0)
+            .await
+            .expect("the restart completes");
+        assert_eq!(download.file_name, "pinned.bin");
+        let record = repo.get_download(id).expect("read back").expect("present");
+        assert_eq!(record.status, DownloadState::Completed);
+        assert_eq!(record.file_name, "pinned.bin");
+        assert_eq!(record.destination, dir.join("pinned.bin"));
+        assert!(!dir.join("kept-name.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn an_engine_owned_partial_pins_the_recorded_name() {
+        let server = MockServer::start().await;
+        server.mount_route("/pinned-partial.bin", Behavior::default());
+        let fixture = Fixture::default();
+        let (scratch, repo) = scratch_repo("pinned-partial");
+        let dir = scratch.path().to_owned();
+        let id = repo
+            .insert_download(
+                NewDownload {
+                    url: server.url("/pinned-partial.bin"),
+                    destination: dir.join("pinned-partial.bin"),
+                    file_name: "pinned-partial.bin".to_owned(),
+                },
+                test_clock(),
+            )
+            .expect("queued record inserted");
+        // An aborted earlier attempt left its engine-owned partial behind;
+        // no facts were confirmed, so the plan restarts from zero — but the
+        // name cannot change under the restart (the partial is named after
+        // it, and the restart reuses that file).
+        stage_partial(&dir, "pinned-partial.bin", b"aborted attempt bytes");
+
+        let download = drive(&repo, &server, "/pinned-partial.bin", &dir, 0)
+            .await
+            .expect("the restarted transfer completes");
+        assert_eq!(download.file_name, "pinned-partial.bin");
+        assert_eq!(download.bytes_written, fixture.len);
+        let record = repo.get_download(id).expect("read back").expect("present");
+        assert_eq!(record.status, DownloadState::Completed);
+        assert_eq!(record.file_name, "pinned-partial.bin");
+        assert_eq!(
+            std::fs::read(dir.join("pinned-partial.bin"))
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice()
         );
     }
 }

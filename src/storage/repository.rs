@@ -725,6 +725,35 @@ impl Repository {
         })
     }
 
+    /// Corrects the planned file name *and* destination of a record whose
+    /// first probe learned a different effective URL than the one that
+    /// queued it (Phase 7 pristine refresh, ADR-0020). Only a record with
+    /// no confirmed facts and no engine-owned partial may be corrected this
+    /// way — the engine owns that policy; the column write is one
+    /// transaction so a crash can never leave the name and the path
+    /// disagreeing. `updated_at` becomes `ts`.
+    pub(crate) fn set_planned_name(
+        &self,
+        id: i64,
+        file_name: &str,
+        destination: &Path,
+        ts: u64,
+    ) -> Result<(), AppError> {
+        let destination = path_text("destination", destination)?;
+        let stamp = seconds_stamp(ts)?;
+        self.write_transaction("updating a download record", |transaction| {
+            let changed = transaction.execute(
+                "UPDATE downloads SET file_name = ?2, destination = ?3, updated_at = ?4 \
+                 WHERE id = ?1",
+                params![id, file_name, destination, stamp],
+            )?;
+            if changed == 0 {
+                return Err(not_found("download record", id).into());
+            }
+            Ok(())
+        })
+    }
+
     /// Inserts a segment plan and returns its id.
     ///
     /// Ranges are inclusive byte spans; an inverted range, or a progress
@@ -1257,6 +1286,35 @@ mod tests {
 
     fn url_fixture() -> &'static str {
         "https://db.test/destination"
+    }
+
+    /// Phase 7's pristine refresh moves a queued record's provisional name
+    /// and destination together in one write: the engine derives both from
+    /// the effective URL after the first probe (ADR-0020).
+    #[test]
+    fn the_planned_name_and_destination_move_together() {
+        let scratch = ScratchDb::new("planned-name");
+        let repo = scratch.open();
+        let id = insert(&repo, "https://db.test/queued", "provisional");
+
+        let renamed = std::env::temp_dir().join("swiftfetch-p7-effective.bin");
+        repo.set_planned_name(id, "effective.bin", &renamed, 1_700_000_002)
+            .expect("planned name corrected");
+        let record = repo.get_download(id).expect("read back").expect("present");
+        assert_eq!(record.file_name, "effective.bin");
+        assert_eq!(record.destination, renamed);
+        // The stamp moves with the write, exactly like the other mutators.
+        assert_eq!(record.updated_at, 1_700_000_002);
+
+        let err = repo
+            .set_planned_name(999, "effective.bin", &renamed, 1_700_000_003)
+            .expect_err("unknown ids cannot be updated");
+        assert_eq!(err.category(), ErrorCategory::Database);
+        assert!(
+            err.message().contains("was not found"),
+            "the message names the absent record: {}",
+            err.message()
+        );
     }
 
     #[test]
