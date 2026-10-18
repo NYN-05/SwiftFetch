@@ -726,6 +726,24 @@ storage::file_writer 6 - together with the three integration targets
   timeout is architecture-fixed); changing them is a `HttpTimeouts`
   default + one locked test, not an API change.
 
+### Phase 4 verification addendum (post-commit, appended 2026-10-18)
+
+- **Commit:** `ec03cbe` - "Phase 4: sequential transfer engine (v0.6.0)"
+  (code + tests + tracking files, 12 files changed, 2187 insertions(+),
+  48 deletions(-)). The phase entry above is part of that commit, so the
+  hash is recorded here and in `git log`, not inside the entry itself
+  (same honesty rule as the Phase 1/2/3 entries).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `ec03cbe` to a fresh temp directory on Windows - the clone was removed
+  after the run; working tree verified clean before the recipe - run in
+  order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 23.4 s check) |
+| `cargo test` | 158 passed, 0 failed (108 unit + 11 cli + 15 fixtures + 24 mock_server), identical to the working-tree run |
+
 
 
 
