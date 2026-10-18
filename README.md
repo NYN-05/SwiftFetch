@@ -12,6 +12,8 @@ implemented yet.
 
 - Product requirements: [`DOCS/PRD.md`](DOCS/PRD.md)
 - Architecture: [`DOCS/architecture.md`](DOCS/architecture.md)
+- Running changelog (all code/feature changes): [`changes.md`](changes.md)
+- Architecture decision record: [`decision.md`](decision.md)
 
 ## Target platform
 
