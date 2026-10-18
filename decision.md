@@ -547,4 +547,64 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0013 | Phase 2 test infrastructure stack (tokio + hyper dev-deps) | Accepted |
 
+---
+
+## ADR-0014 - Phase 3: unit tests reuse the Phase 2 mock server via a `cfg(test)` module include; no `lib.rs`
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** Phase 3 (`DOCS/phases.md` §6) requires network-covered tests
+  for the shared client and the resource prober, and the testing rule
+  forbids live external URLs, so they must run against the Phase 2
+  controlled mock server in `tests/common/`. The prober and its `HttpClient`
+  live in the binary crate (`src/download/`, ADR-0004's modular monolith);
+  Rust integration-test binaries cannot link against a `bin`-only crate's
+  internals, so a `tests/` integration target cannot reach
+  `HttpClient::default_client` or `probe()` directly.
+- **Decision:** Declare the shared test support once more, as a test-only
+  module of the binary crate, in `src/main.rs`:
+
+  ```rust
+  #[cfg(test)]
+  #[path = "../tests/common/mod.rs"]
+  pub(crate) mod common;
+  ```
+
+  The inline unit tests in `src/download/probe.rs` then use
+  `crate::common::server::MockServer` exactly as the integration tests do.
+  A `lib.rs` split is deliberately **not** introduced: no phase requires
+  one, the architecture keeps a single binary crate, and such a split is
+  the kind of structural change that needs its own ADR (per the
+  "thin lib split is an ADR, not a quiet change" rule).
+- **Alternatives considered:**
+  1. **Introduce `lib.rs` now** so `tests/` can link the engine - rejected:
+     late structural churn without a phase that needs it; would also
+     silently change which items are "public API".
+  2. **Duplicate a small mock server inside `src/` guarded by `cfg(test)`**
+     - rejected: two copies of the server must never drift; `tests/common/`
+     is the single source of truth for HTTP failure simulation.
+  3. **Merge `tests/mock_server.rs` into the unit target** - rejected: the
+     Phase 2 integration binaries keep testing the shared module through
+     the normal `tests/` mechanism; nothing changes for them.
+- **Consequences:**
+  - With-angle-path resolution: `#[path]` is relative to the containing
+    file, so the declaration lives in `main.rs` (`../tests/common/mod.rs`
+    = repo-root `tests/`); deeper modules reference it as `crate::common`.
+  - The fixture's six inline tests now execute in **both** test targets:
+    `tests/fixtures.rs` and the binary's unit target (as
+    `common::fixture::tests::...`). Total test counts double-count these
+    six; this is disclosed in `changes.md` rather than hidden.
+  - Zero impact on non-test builds: `cfg(test)` code never reaches the
+    product binary.
+- **Related:** ADR-0004 (single-crate layout), ADR-0008 (verification
+  recipe), ADR-0010 (append-only tracking law), ADR-0013 (test-infra
+  stack), `changes.md` Phase 3 entry.
+
+### Addendum-index extension (ADR-0014 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0014 | Phase 3 unit tests reuse `tests/common` via `cfg(test)` include | Accepted |
+
+
 

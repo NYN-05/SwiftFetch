@@ -11,8 +11,17 @@ use clap::Parser;
 mod app;
 mod cli;
 mod config;
+mod download;
 mod error;
 mod logging;
+
+/// Phase 3 test-support include: the binary's own unit tests (e.g. the
+/// network-bound tests in `src/download/probe.rs`) reuse the controlled
+/// Phase 2 mock server by including this shared module under `cfg(test)`.
+/// Test-support code never reaches a non-test compilation of the product.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod common;
 
 fn main() {
     let cli = cli::Cli::parse();

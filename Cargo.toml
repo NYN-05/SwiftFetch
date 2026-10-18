@@ -1,6 +1,6 @@
 [package]
 name = "swift-fetch"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
@@ -8,6 +8,11 @@ publish = false
 # Phase 1 introduces the CLI shell, configuration, errors, and logging.
 # Stack crates are added only when a phase first uses them (DOCS/phases.md).
 [dependencies]
+# Phase 3: shared HTTP client for probe/transfers (architecture §3). A single
+# configured client is reused for every request. No compression features: a
+# transparent content transform would invalidate byte-range offsets, and
+# Phase 3 must record only facts the responses actually support.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "http2"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

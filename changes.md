@@ -387,7 +387,7 @@ never linked into the product binary (see ADR-0013). `Cargo.lock` committed.
 
 ### Phase 2 verification addendum (post-commit, appended 2026-10-18)
 
-- **Commit:** `a5c0ce8` — "Phase 2: controlled HTTP test infrastructure
+- **Commit:** `a5c0ce8` - "Phase 2: controlled HTTP test infrastructure
   (v0.4.0)" (code + tests + tracking files). The entry above and its hashes
   are part of that commit, so the hash is recorded here and in `git log`,
   not inside the entry itself (same honesty rule as the Phase 1 entry).
@@ -400,6 +400,132 @@ never linked into the product binary (see ADR-0013). `Cargo.lock` committed.
 | `cargo fmt --check` | pass |
 | `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
 | `cargo test` | 79 passed (29 unit + 11 cli + 15 fixtures + 24 mock_server), 0 failed |
+
+---
+
+## Phase 3 - HTTP Client and Resource Probing
+
+- **Date:** 2026-10-18
+- **Version:** `0.4.0` → `0.5.0`
+- **Outcome:** Phase 3 exit gate met (working tree). A shared, configured
+  `reqwest::Client` and the resource prober are implemented and network-
+  tested against the Phase 2 mock server; URLs are validated at the scheme
+  level with typed `Input` errors; probe facts come only from response
+  headers and contradictory metadata is never silently trusted. Every CLI
+  command still dispatches an honest not-implemented error (wiring is
+  Phase 11). No storage, no SQLite, no ZIP work.
+
+### Dependencies added (approved stack, first use)
+
+`reqwest 0.12.28` (resolved from `0.12`) in `[dependencies]` with
+`default-features = false`, `features = ["native-tls", "http2"]`:
+native-tls maps to Windows SChannel on the first-class platform and no
+compression feature is enabled. Verified empirically with `cargo tree -i`:
+`flate2`, `brotli`, and `zstd` match **no packages**, so no transparent
+content transform can shift byte offsets. Every request additionally sends
+`Accept-Encoding: identity`. Transitive crates are recorded in the committed
+`Cargo.lock`. Test-only crates were extended, not moved: the binary's unit
+tests now also compile `tests/common/` under `cfg(test)` (ADR-0014), so the
+Phase 2 dev-dependencies are shared, never leaked into the product build.
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | version `0.5.0`; first `[dependencies]` entry `reqwest` with a first-use phase comment (ADR-0003) |
+| `Cargo.lock` | reqwest `0.12.28` + transitive crates; committed per the standing rule |
+| `src/download/mod.rs` | Phase 3 module declared: `http` (shared client) + `probe` (prober); doc comment states the prober contract and points at ADR-0014 for test reuse |
+| `src/download/http.rs` | NEW. `HttpClient` wraps one configured `reqwest::Client` (connect timeout 15 s and provisional overall timeout 30 s per architecture §6, redirect limit 10, `Accept-Encoding: identity` on every request). `send()` issues HEAD/GET (+ optional Range) and maps failure to typed `AppError`s; `http_error()` keeps a raw URL, when reqwest embeds one, only in the hidden diagnostic source while the user-facing message carries `logging::redact_url` output. Two inline unit tests lock the timeout defaults |
+| `src/download/probe.rs` | NEW. `probe(client, url)` (≤ 2 bounded requests, bodies never read): strict URL validation (`http`/`https` only, otherwise `Input`/exit 2); primary `HEAD`; 405/501 fall back to one `bytes=0-0` ranged GET as primary; `Content-Length: 0` short-circuit (size `Some(0)`, ranges `Unknown`, no follow-up request); strict header parsers (`Content-Length` with multi-header conflict rejection, `Content-Range` exact-interval form, 416 `bytes */N` total form, `Content-Encoding` identity/transform classification); contradiction rules (HEAD vs `Content-Range` total, duplicated CL, mismatched interval, non-identity encoding ⇒ distrust everything range-related); non-206/200/416 ranged answers and transport failures degrade ranges to `Unknown` while preserving HEAD-side facts (with a warning log); effective URL recorded after redirects; ETag/Last-Modified recorded (ranged/GET response wins when present). `probe_by_ranged_get()` serves HEAD-unsupported or size-silent resources. 37 inline tests |
+| `src/main.rs` | `mod download;` wired; `#[cfg(test)] #[path = "../tests/common/mod.rs"] pub(crate) mod common;` declares the shared test support inside the binary crate (ADR-0014) |
+| `src/logging.rs` | `redact_url` `dead_code` waiver removed: the Phase 3 modules call it on every logged/response URL (per the narrow-waiver rule, waivers retire when items become load-bearing) |
+| `src/error.rs` | `AppError::with_source` `dead_code` waiver removed: `HttpClient` builds and `http_error()` are genuine callers now |
+| `tests/common/server.rs` | Phase 3 knobs added to `Behavior` (all default `None`, so Phase 2 routes are behaviorally unchanged): `head_status` (HEAD-only answer override, e.g. 405/501), `head_content_length` (`HeadLength::Value(n)` via a manually set header - hyper transmits it verbatim, including `0`, which an exact zero size hint would omit - or `HeadLength::Omit`; an unparseable text cannot be simulated because hyper refuses to transmit it, documented on the type), `get_status` (GET-only sentinel, HEAD keeps succeeding), `content_encoding` (attaches `Content-Encoding` to HEAD/200/206 answers). `RecordedRequest` gains a lowercased `headers` capture (duplicate names comma-joined); the generic redirect responses now also increment route hit counts so tests can assert probe hops; `host_header()` helper exposes the HTTP/1.1-mandated `Host` value |
+| `tests/common/mod.rs` | Doc comment updated: the module is also the binary unit tests' mock-server source (ADR-0014); still excluded from non-test builds |
+| `tests/mock_server.rs` | The arrival-order test's expected literals carry the new `headers` field: the HTTP/1.1-mandated `host` entry (value from `MockServer::host_header()`, since the shot includes the ephemeral port) plus the raw `range` header; all pre-existing assertions (order, method, path, range, hit counts) unchanged |
+
+### Behavior contract (Phase 3)
+
+- `request shape`: at most two requests per probe (HEAD, then exactly one
+  ranged GET `bytes=0-0` when the HEAD passes); every request goes through
+  the single configured client with `Accept-Encoding: identity`; response
+  bodies are never read.
+- `facts`: size and range support are recorded only from response headers,
+  with conflicts resolved by distrust (contradiction ⇒ `Unknown`/`None`,
+  never a guess); absent or invalid `Content-Length`, `bytes 0-0/*`,
+  416 `bytes */N`, and a lying HEAD are all handled without ever trusting a
+  contradictory value.
+- `redirects`: followed up to the limit; the effective URL is recorded;
+  loops and over-limit chains fail with a typed HTTP error.
+- `errors`: connection failures, timeouts, and non-2xx primary answers are
+  `ErrorCategory::Http` (exit 1) with redacted URLs in every message;
+  scheme-invalid and unparseable URLs are `ErrorCategory::Input`
+  (exit 2) before any network traffic.
+
+### Defects caught before commit (recorded honestly)
+
+1. The secondary-degrade path originally carried a leftover
+   `let _ = http_error(err);` that referenced an unimported symbol - the
+   branch already receives a typed `AppError`, whose `Display` is log-safe;
+   the line was removed before the first successful build.
+2. First mapping folded every non-206/200/416 ranged answer into
+   `Contradicted`, silently erasing good HEAD facts on a 5xx/404 blip.
+   Added `RangeAnswer::Other`: HEAD-side size/validators survive, ranges
+   go to `Unknown` (locked by the 500/404 degradation test).
+3. `const fn` setters cannot assign `Option<HeadLength>` (a `String`
+   lives inside `Raw` at the time); the compiler caught it; the setters
+   dropped `const` and `HeadLength::Raw` was removed entirely once hyper
+   proved it cannot transmit unparseable `Content-Length` values.
+4. The `cl_map` test helper used `HeaderMap::insert`, which *replaces*
+   same-name values, so the conflicting-duplicate parser case passed
+   vacuously; switched to `append`, showing the strict multi-header rule
+   actually firing.
+5. Empirical discoveries (temporary scratch experiment, deleted after the
+   observation): (a) hyper omits `Content-Length` entirely for HEAD
+   answers whose exact size hint is 0, and (b) hyper aborts the
+   connection rather than sending a manually set non-numeric
+   `Content-Length`. Consequences: the empty-resource coverage became two
+   tests - a manual `Content-Length: 0` HEAD (short-circuit, one request)
+   and the natural no-CL path whose `bytes 0-0` range request answers 416
+   `bytes */0`; and the probe's 416 arm gained its own
+   `parse_unsatisfiable_total` (the 206 parser intentionally rejects the
+   `bytes */N` form, which had silently dropped the total).
+6. Redirect responses did not increment route hit counts (the counter
+   sits after the redirect short-circuit), so the redirect-follow test
+   could not assert the probe's hops; redirect answers now count too.
+
+### Verification - actual results (all run on Windows)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (after applying rustfmt) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (one needless-borrow in new test support fixed) |
+| `cargo test` | 124 passed, 0 failed: 74 unit (29 pre-existing + 2 http + 37 probe + 6 fixture-inline, the last obtained via the `#[path]` include and also counted in the fixtures target) + 11 cli + 15 fixtures + 24 mock_server |
+| Fresh-clone gate reproduction | see the post-commit addendum at the bottom of this file |
+
+### Scope-control and honesty notes
+
+- No command wiring: `download`/`status`/`resume`/`retry` still print the
+  not-implemented line and exit `1`; the CLI integration suite (11 tests)
+  is byte-for-byte behaviorally unchanged.
+- no lib.rs: the unit tests reuse `tests/common/` through the `cfg(test)`
+  include (ADR-0014). Consequence (disclosed, not hidden): the fixture
+  module's six inline tests run in two test targets, and the totals above
+  double-count them.
+- `dead_code` waivers: file-level in `src/download/http.rs` and
+  `src/download/probe.rs` only, each citing the phase that wires them;
+  two other waivers retired this phase (`logging::redact_url`,
+  `error::with_source`) because they became load-bearing.
+- HTTPS verify-limitation (disclosed): the TLS success path is not
+  exercised by a local test - no live external URLs are allowed, and a
+  local TLS endpoint would add non-stack dev crates (cert generation +
+  tokio-rustls) for this phase only. What is verifiable offline is the
+  scheme-level URL validation (`https` accepted without network, locked by
+  a unit test) and identical code paths for both schemes; the actual
+  SChannel handshake on Windows remains unverified by Phase 3 tests.
+- Windows honesty: every check in the table ran on Windows (MSVC,
+  rustc 1.99.1); nothing in this phase was verified on another platform,
+  and nothing was presented as Windows proof that wasn't.
 
 
 

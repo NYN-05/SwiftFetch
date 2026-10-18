@@ -47,7 +47,6 @@ pub fn level_filter(verbose: bool) -> LevelFilter {
 /// Malformed input never panics: anything that cannot be recognized is
 /// passed through without scheme/userinfo handling. Crucially the caller
 /// logs the returned string, never the original URL.
-#[allow(dead_code)] // becomes load-bearing when download logging lands (Phase 3+)
 #[must_use]
 pub fn redact_url(url: &str) -> String {
     const MASK: &str = "[REDACTED]";

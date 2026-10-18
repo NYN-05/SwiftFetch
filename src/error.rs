@@ -137,7 +137,6 @@ impl AppError {
 
     /// Attaches an internal diagnostic source that never appears in the
     /// user-facing `Display` output.
-    #[allow(dead_code)] // transferred modules supply sources from Phase 3 on
     #[must_use]
     pub fn with_source(mut self, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         self.source = Some(source.into());

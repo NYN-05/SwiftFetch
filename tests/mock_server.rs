@@ -15,6 +15,7 @@ use common::server::{http_client, Behavior, MockServer, RangeMode, RecordedReque
 use http_body_util::{BodyExt, Empty};
 use hyper::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, LOCATION};
 use hyper::{Method, Request, Response, StatusCode};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 type TestClient = hyper_util::client::legacy::Client<
@@ -128,6 +129,10 @@ async fn request_log_captures_method_path_range_in_arrival_order() {
     let _ = send(&client, &url, Method::HEAD, None).await;
 
     let log = server.requests();
+    // Header capture is new in Phase 3. The `Host` entry is the HTTP/1.1
+    // transport mandate (not a client choice), so the expectation names it
+    // explicitly; unrelated clients stay free to send whatever they need.
+    let host = ("host".to_owned(), server.host_header());
     assert_eq!(
         log,
         vec![
@@ -135,16 +140,22 @@ async fn request_log_captures_method_path_range_in_arrival_order() {
                 method: "GET".to_owned(),
                 path: "/f".to_owned(),
                 range: None,
+                headers: BTreeMap::from([host.clone()]),
             },
             RecordedRequest {
                 method: "GET".to_owned(),
                 path: "/f".to_owned(),
                 range: Some("bytes=0-9".to_owned()),
+                headers: BTreeMap::from([
+                    host.clone(),
+                    ("range".to_owned(), "bytes=0-9".to_owned())
+                ]),
             },
             RecordedRequest {
                 method: "HEAD".to_owned(),
                 path: "/f".to_owned(),
                 range: None,
+                headers: BTreeMap::from([host]),
             },
         ]
     );

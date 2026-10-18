@@ -13,7 +13,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -24,7 +24,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::body::{Body, Frame, SizeHint};
-use hyper::header::{HeaderValue, CONTENT_RANGE, ETAG, LAST_MODIFIED, LOCATION, RANGE};
+use hyper::header::{
+    HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, LOCATION,
+    RANGE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -64,6 +67,25 @@ pub enum Validators {
     Changing,
 }
 
+/// HEAD-specific `Content-Length` handling for the Phase 3 metadata
+/// scenarios (lying or missing HEAD answers).
+///
+/// # Limitation
+/// An *unparseable* header text cannot be simulated here: hyper refuses to
+/// transmit a response whose manually set `Content-Length` is not numeric
+/// (verified empirically), so that case is covered by the strict parser
+/// unit tests instead (an omitted header behaves identically to an
+/// invalid one at the probe level).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadLength {
+    /// Advertise this exact value as a manually set header, whether or not
+    /// it is the real length (hyper transmits it verbatim, including `0` —
+    /// an exact zero size hint would be omitted from the message).
+    Value(u64),
+    /// Omit the header entirely (no exact size hint on the HEAD response).
+    Omit,
+}
+
 /// The canned behavior of one route on the mock server.
 #[derive(Clone, Debug)]
 pub struct Behavior {
@@ -86,6 +108,18 @@ pub struct Behavior {
     pub redirect: Option<(u16, String)>,
     pub etag: Validators,
     pub last_modified: Validators,
+    /// Answer HEAD with this status instead of the metadata response
+    /// (simulates HEAD-unsupported servers: 405, 501, broken handlers).
+    pub head_status: Option<u16>,
+    /// HEAD `Content-Length` override for HEAD-metadata scenarios.
+    pub head_content_length: Option<HeadLength>,
+    /// Answer GET with this status instead of normal handling, while HEAD
+    /// keeps succeeding (a ranged verification request may fail elsewhere).
+    pub get_status: Option<u16>,
+    /// Attach this `Content-Encoding` to 200/206/HEAD responses, which is
+    /// how a content transformation that invalidates byte offsets is
+    /// simulated.
+    pub content_encoding: Option<String>,
 }
 
 impl Default for Behavior {
@@ -101,6 +135,10 @@ impl Default for Behavior {
             redirect: None,
             etag: Validators::Omit,
             last_modified: Validators::Omit,
+            head_status: None,
+            head_content_length: None,
+            get_status: None,
+            content_encoding: None,
         }
     }
 }
@@ -165,6 +203,36 @@ impl Behavior {
         self.last_modified = mode;
         self
     }
+
+    #[must_use]
+    pub const fn with_head_status(mut self, status: u16) -> Self {
+        self.head_status = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub fn with_head_length(mut self, length: u64) -> Self {
+        self.head_content_length = Some(HeadLength::Value(length));
+        self
+    }
+
+    #[must_use]
+    pub fn with_head_length_omitted(mut self) -> Self {
+        self.head_content_length = Some(HeadLength::Omit);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_get_status(mut self, status: u16) -> Self {
+        self.get_status = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub fn with_content_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.content_encoding = Some(encoding.into());
+        self
+    }
 }
 
 /// One request as observed by the mock server, in arrival order.
@@ -175,6 +243,10 @@ pub struct RecordedRequest {
     pub path: String,
     /// Raw `Range` header value, if the client sent one.
     pub range: Option<String>,
+    /// All request headers as received (names lowercased; duplicate names
+    /// comma-joined). Phase 3 uses this to assert the probe's
+    /// `Accept-Encoding: identity` byte-offset discipline.
+    pub headers: BTreeMap<String, String>,
 }
 
 struct Shared {
@@ -243,6 +315,13 @@ impl MockServer {
     #[must_use]
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The `Host` header value every HTTP/1.1 client must send
+    /// (`127.0.0.1:<port>`), for tests that assert captured headers.
+    #[must_use]
+    pub fn host_header(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 
     /// Absolute URL for a route path, e.g. `/fixture`.
@@ -453,6 +532,20 @@ fn with_validators(
     }
 }
 
+/// Attaches the optional `Content-Encoding` to a response builder.
+fn with_encoding(
+    builder: hyper::http::response::Builder,
+    encoding: Option<&String>,
+) -> hyper::http::response::Builder {
+    match encoding {
+        Some(value) => builder.header(
+            CONTENT_ENCODING,
+            HeaderValue::from_str(value).expect("content-encoding value is a valid header value"),
+        ),
+        None => builder,
+    }
+}
+
 /// Body handed to hyper: either exact bytes (Content-Length derived from
 /// the size hint) or a frame stream (delayed data, chunked encoding, and /
 /// or a mid-body connection drop).
@@ -600,6 +693,17 @@ async fn handle(
         .unwrap_or_else(|| route_key.clone());
     let range_header = req.headers().get(RANGE).cloned();
 
+    let mut captured_headers: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in req.headers() {
+        let entry = captured_headers
+            .entry(name.as_str().to_owned())
+            .or_default();
+        if !entry.is_empty() {
+            entry.push_str(", ");
+        }
+        entry.push_str(value.to_str().unwrap_or(""));
+    }
+
     shared
         .log
         .lock()
@@ -610,6 +714,7 @@ async fn handle(
             range: range_header
                 .as_ref()
                 .map(|value| value.to_str().unwrap_or("").to_owned()),
+            headers: captured_headers,
         });
 
     let behavior = shared
@@ -629,6 +734,12 @@ async fn handle(
     }
 
     if let Some((code, location)) = behavior.redirect {
+        // Redirect responses count as visits to this route too, so tests
+        // can assert the hops a probe actually took.
+        {
+            let mut counters = shared.hits.lock().expect("hit counter lock");
+            *counters.entry(route_key.clone()).or_insert(0) += 1;
+        }
         let response = Response::builder()
             .status(status_code(code))
             .header(LOCATION, location)
@@ -661,13 +772,51 @@ async fn handle(
 
     let fixture = &behavior.fixture;
     if method == Method::HEAD {
-        return Ok(with_validators(
-            Response::builder().status(StatusCode::OK),
-            etag_header.as_ref(),
-            modified_header.as_ref(),
-        )
-        .body(TestBody::head_only(fixture.len))
-        .expect("HEAD response builds"));
+        if let Some(code) = behavior.head_status {
+            return Ok(Response::builder()
+                .status(status_code(code))
+                .body(TestBody::head_only(0))
+                .expect("HEAD status-override response builds"));
+        }
+        let builder = with_encoding(
+            with_validators(
+                Response::builder().status(StatusCode::OK),
+                etag_header.as_ref(),
+                modified_header.as_ref(),
+            ),
+            behavior.content_encoding.as_ref(),
+        );
+        return Ok(match &behavior.head_content_length {
+            Some(HeadLength::Value(length)) => {
+                // A manually set header: hyper transmits it verbatim,
+                // including `0` (an exact size hint of 0 would be omitted).
+                let text = length.to_string();
+                builder
+                    .header(
+                        CONTENT_LENGTH,
+                        HeaderValue::from_str(&text)
+                            .expect("a numeric length is a valid header value"),
+                    )
+                    .body(TestBody::stream(Bytes::new(), STREAM_CHUNK, None, None))
+                    .expect("HEAD length-override response builds")
+            }
+            Some(HeadLength::Omit) => builder
+                // No exact size hint: hyper omits Content-Length on HEAD.
+                .body(TestBody::stream(Bytes::new(), STREAM_CHUNK, None, None))
+                .expect("HEAD length-omitted response builds"),
+            None => builder
+                .body(TestBody::head_only(fixture.len))
+                .expect("HEAD response builds"),
+        });
+    }
+
+    if let Some(code) = behavior.get_status {
+        let sentinel = format!("status-{code}");
+        let len = sentinel.len() as u64;
+        return Ok(Response::builder()
+            .status(status_code(code))
+            .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+            .expect("GET status-override response builds"));
     }
     let (range_status, content_range, data, advertised): (u16, Option<String>, Arc<Vec<u8>>, u64) =
         match parse_range(range_header.as_ref(), fixture.len) {
@@ -713,10 +862,13 @@ async fn handle(
             },
         };
 
-    let mut response_builder = with_validators(
-        Response::builder().status(status_code(range_status)),
-        etag_header.as_ref(),
-        modified_header.as_ref(),
+    let mut response_builder = with_encoding(
+        with_validators(
+            Response::builder().status(status_code(range_status)),
+            etag_header.as_ref(),
+            modified_header.as_ref(),
+        ),
+        behavior.content_encoding.as_ref(),
     );
     if let Some(header) = content_range {
         response_builder = response_builder.header(
