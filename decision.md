@@ -497,4 +497,54 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0012 | Public remote repository and first push (owner-directed) | Accepted |
 
+---
+
+## ADR-0013 — Phase 2 test infrastructure: tokio + hyper stack in `[dev-dependencies]` only
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** Phase 2 (DOCS/phases.md §5) requires a controllable local
+  HTTP test server able to serve correct/malformed/incomplete responses,
+  honor or break byte ranges, truncate connections, delay delivery, omit
+  `Content-Length`, redirect, and change validators — before any
+  production download code exists (an explicit exit-gate constraint). The
+  approved product stack (architecture §3) names **Reqwest** as the
+  engine's HTTP client (added with Phase 3, per ADR-0003 phase gating);
+  Reqwest itself sits on hyper. No previous phase introduced any network
+  crate.
+- **Decision:** Build the mock server on **hyper 1.x** (raw server
+  connection control) with **hyper-util** (legacy client + Tokio IO),
+  **tokio** (tests-only runtime), **http-body-util**, and **bytes**,
+  declared strictly under `[dev-dependencies]` with a version-lift noted
+  in `changes.md` (`0.3.0` → `0.4.0`). These crates compile under
+  `tests/` only and never link into the product binary. Default fixtures
+  are a pure function of `(seed, index)` (splitmix-style scramble),
+  giving exact-content checks and a recorded golden hash contract without
+  a crypto dependency.
+- **Alternatives considered:**
+  1. **Reqwest-only dev-dep plus a third-party mocking crate** (e.g. a
+     wiremock-style library) — rejected: introduces a crate outside the
+     approved stack without replacing hyper directly; precise response
+     metadata lies (mismatched Content-Range), mid-body RST, and omitted
+     Content-Length control are cleaner against raw hyper.
+  2. **Hand-rolled HTTP server on `TcpListener`** — rejected: a nonconforming
+     parser would make engine tests lie about HTTP/1.1 semantics.
+  3. **Put tokio/hyper into `[dependencies]` from Phase 2** — rejected:
+     test-only crates must never leak into the product binary; the
+     product will get its own stack entries in the phases that first use
+     them (Reqwest at Phase 3).
+- **Tradeoffs:** Integration-test builds compile hyper + tokio + hyper-util
+  (+ transitive) dev crates; the product binary is unaffected. A future
+  ADR will record Reqwest arriving as the engine's HTTP client with a
+  single shared, configured client (never per-request).
+- **Related:** ADR-0003 (phase-gated dependency onboarding),
+  ADR-0008 (verification recipe), ADR-0011 (identity/naming),
+  `changes.md` Phase 2 entry.
+
+### Addendum-index extension (ADR-0013 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0013 | Phase 2 test infrastructure stack (tokio + hyper dev-deps) | Accepted |
+
 

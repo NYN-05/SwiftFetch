@@ -300,3 +300,90 @@ recorded in the git log on `origin/main` immediately after the push.
 
 
 
+---
+
+## Phase 2 — Controlled HTTP Test Infrastructure
+
+- **Date:** 2026-10-18
+- **Version:** `0.3.0` → `0.4.0`
+- **Outcome:** Phase 2 exit gate met. Deterministic fixtures, a controlled
+  loopback mock server, and reproducible failure scenarios now cover every
+  HTTP behavior the transfer-engine phases will face; the suite runs fully
+  offline. **No production download code** — `src/download`, `src/storage`,
+  `src/archive` remain undeclared placeholder modules.
+
+### Dependencies added (approved stack, test-only)
+
+All under `[dev-dependencies]`, never `[dependencies]`: `tokio 1.53.3`
+(rt-multi-thread, macros, net, io-util, time, sync, test-util),
+`hyper 1.12.0` (http1, server, client), `hyper-util 0.1.21`
+(client-legacy, client, http1, tokio), `http-body-util 0.1.5`,
+`bytes 1.12.1`. Test-support crates compile under `tests/` only and are
+never linked into the product binary (see ADR-0013). `Cargo.lock` committed.
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `tests/common/mod.rs` | NEW. Declares the shared test-support modules |
+| `tests/common/fixture.rs` | NEW. `pattern_byte(seed, index)` splitmix-style closed form; `Fixture` (seed, len) with `byte_at`, `bytes()`, inclusive/clamped `slice(start, end)`; six inline unit tests; default fixture seed 1, 4096 bytes |
+| `tests/common/server.rs` | NEW. `MockServer` binds `127.0.0.1:0` (hyper 1, one accept task, per-connection tasks, watch-channel shutdown, `Drop` aborts the accept loop). Per-route `Behavior`: honored / ignored / broken-headers / broken-body ranges, 416 with `bytes */total`, full-cover → 200, malformed → 200, mid-body truncation, configurable statuses (sentinel `status-<code>` bodies, never fixture bytes), redirects (raw, unfollowed), omitted `Content-Length` (chunked), header + per-body-frame delays, static/changing ETag and Last-Modified (hit-counter driven; `Changing` Last-Modified cycles two precomputed valid IMF-fixdate strings — no chrono dependency), HEAD with exact Content-Length. Request log (method, path incl. query, raw Range), per-route hit counts, `shutdown_wait()`, reusable `http_client()` (hyper-util legacy client) |
+| `tests/fixtures.rs` | NEW, 9 tests: golden first-32-bytes array + two FNV-1a checksums (recorded on Windows from the generator; inline 5-line FNV — no crypto crate), byte-by-byte `pattern_byte` agreement, exact slice windows, cross-seed distinctness, panic contract for out-of-range `byte_at` |
+| `tests/mock_server.rs` | NEW, 18 tests: one per server mode; smoke start/stop asserting exact 200 + Content-Length + body and that the port refuses connections after `shutdown_wait`; request log arrival order; repeatable truncation across 3 attempts; delay scenario run twice with headers ≥ 90 ms, total ≥ 340 ms, total < 2000 ms; static vs changing validators (ETag three distinct values; Last-Modified cycles back); redirect answered raw with the target route untouched; status sentinels never equal fixture bytes; HEAD probe semantics; unknown routes → 404 sentinel |
+| `Cargo.toml` | version `0.4.0`; `[dev-dependencies]` block with stack-discipline comment |
+
+### Behavior contract (test infrastructure)
+
+- Every engine-facing network surface has a local simulation: normal 200
+  with exact Content-Length, correct 206 + Content-Range slicing, ignored
+  ranges, mismatched Content-Range, right headers with wrong bytes, 416
+  with `bytes */total`, malformed ranges falling back to 200, truncation
+  that never completes a transfer, bounded repeatable delays, missing
+  Content-Length, redirects the client must not auto-follow, validator
+  changes between requests, and connection refusal after shutdown.
+- Sentinel bodies for non-200 statuses make "an HTTP error body is not
+  file content" expressly testable from Phase 3 onward.
+- No test contacts a live external URL; loopback ephemeral ports only.
+
+### Defects caught before commit (recorded honestly)
+
+1. **Seed-blind first scramble.** `pattern_byte` v1 XORed the seed into
+   bits ≥ 47 (`rotate_left(17)`), so seeds differing only in low bits
+   (1 vs 2) produced identical content — the seed-distinctness test would
+   have failed. Replaced with a splitmix-style mix (xor seed → multiply →
+   rotate → multiply) before any commit; golden values were then recorded
+   via a temporary print-only test and converted into strict asserts.
+2. **Validators dropped from GET responses.** ETag/Last-Modified were
+   attached only to the HEAD builder, so both validator tests failed on
+   the first full run; a shared `with_validators` helper now supports
+   every response the route returns (HEAD included).
+3. **`shutdown_wait` held a `std::sync::MutexGuard` across `.await`**
+   (clippy::await_holding_lock under `-D warnings`); the take now happens
+   in its own statement so the guard drops before the await.
+4. **Truncation test honesty on Windows.** The first truncation test
+   assumed the client always sees response headers before the abort; on
+   Windows the kernel can discard buffered response data on the abrupt
+   close, surfacing the failure at `request()` instead of during
+   `.collect()`. The test now accepts either outcome and proves in both
+   that the transfer never completes.
+
+### Verification — actual results (all run on Windows)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
+| `cargo test` | 79 passed (29 unit + 11 cli + 15 fixtures + 24 mock_server), 0 failed |
+| Fresh-clone gate reproduction | see ADR-0008 recipe outcome appended after commit |
+
+### Scope-control notes
+
+- File-level `#![allow(dead_code)]` appears only in `tests/common/*`,
+  each with a documented reason: the module is compiled into every
+  integration test binary and each binary uses a subset of the helpers.
+- Zero production dependencies added; zero `src/` changes this phase.
+- Unmounted routes answer the 404 sentinel by design, so route typos in
+  later tests can never silently serve fixture bytes.
+
+
+

@@ -1,6 +1,6 @@
 [package]
 name = "swift-fetch"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
@@ -12,3 +12,16 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Phase 2: controlled HTTP test infrastructure (tests only).
+# PostgreSQL-style server bodies stay out of the product binary: these crates
+# compile test-support code under tests/ and are never linked into the CLI.
+# hyper stays inside the layering approved by DOCS/architecture.md §3
+# ("Hyper through the HTTP ecosystem"); per phase, none of these reach
+# [dependencies] until the engine itself requires them.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "test-util"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
