@@ -23,7 +23,70 @@ companion ADR file, [`decision.md`](decision.md).
 
 ---
 
-## Phase 0 — Repository and Build Foundation
+## Phase 1 — CLI Shell, Configuration, Errors, and Logging
+
+- **Date:** 2026-10-18
+- **Version:** `0.1.0` → `0.2.0`
+- **Outcome:** Phase 1 exit gate met. The Clap-based command surface, typed
+  errors, configuration model, and logging are in place; every command
+  dispatches an honest not-implemented error. **No transfer engine.**
+
+### Dependencies added (approved stack, first use)
+
+`clap 4.6.7` (derive), `thiserror 2.0.21`, `tracing 0.1.44`,
+`tracing-subscriber 0.3.23`; transitive crates recorded in the committed
+`Cargo.lock`. `serde` remains deferred (no config file is read in Phase 1).
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `src/main.rs` | Rewritten as thin entry point: parse CLI → install logging → `app::run` → map typed errors to exit codes (0/1/2). Phase 0 banner removed (supersession recorded in ADR-0009) |
+| `src/cli/commands.rs` | NEW. Clap contract: `download` (URLs, `--url-file`, `--output`, `--files`, `--segments`, `--retries`, `--no-extract`), `status`, `resume`, `retry`, global `--verbose`. Help text discloses that no command is wired to the transfer engine yet |
+| `src/cli/mod.rs` | Rewritten from placeholder: option→config mapping, early input validation (URL scheme, missing input), unit tests |
+| `src/app/mod.rs` | Rewritten from placeholder: `run()` dispatches commands |
+| `src/app/commands_handler.rs` | NEW: per-command handlers; Phase 1 contains only the not-implemented guards |
+| `src/config.rs` | NEW: `AppConfig` (output dir, concurrency 3, segments 4, retries 5, ZIP extraction enabled) with validation: `--files/--segments` must be ≥ 1; empty/NUL/non-Unicode output paths rejected; `retries = 0` is valid (no retries) |
+| `src/error.rs` | NEW: `ErrorCategory` taxonomy from architecture §12 with stable kebab-case ids and exit codes (input → 2, all else → 1); `AppError` keeps user-facing message separate from internal diagnostic source |
+| `src/logging.rs` | NEW: tracing subscriber on stderr (concise INFO; `--verbose` → DEBUG); `redact_url` strips query+fragment entirely and masks userinfo passwords — the rule every later module must apply when logging URLs |
+| `tests/cli.rs` | NEW integration tests (11) |
+| `tests/entry_point.rs` | REMOVED — superseded, not weakened: it pinned the Phase 0 banner contract that this phase deliberately replaces; `--help`/`--version` tests now cover the new contract (ADR-0005 superseded by ADR-0009) |
+
+### Behavior contract
+
+- Exit codes: `0` success (not reachable in Phase 1), `1` requested
+  operation cannot proceed (incl. not-implemented), `2` invalid
+  invocation/configuration (Clap parse and config validation both land here).
+- Not-implemented commands print `error: the <command> command is not
+  implemented yet; it will be available when its phase arrives` on stderr,
+  never report success, and leave stdout empty.
+
+### Defect caught before commit
+
+The redaction test suite exposed a bug pre-commit: a bare username
+(`user@host`) was masked as if it contained a password. Fixed: password-only
+userinfo (empty username) alone is masked.
+
+### Verification — actual results (all run on Windows)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
+| `cargo test` | 40 passed (29 unit + 11 integration), 0 failed |
+
+### Scope-control notes
+
+- URL-list file *content* is not read yet (engine phases); `--url-file`
+  presence alone satisfies the input requirement.
+- URL validation is scheme-level only; deep URL parsing arrives with the
+  HTTP layers (Phases 3/7).
+- Narrow `allow(dead_code)` waivers mark taxonomy/error helpers that only
+  tests exercise today; each cites the phase that makes them load-bearing
+  (see `src/error.rs`, `src/logging.rs`).
+- `AGENTS.md` (owner-added governance notes) remains uncommitted; its
+  "docs-only" status line is stale relative to the repo.
+
 
 - **Date:** 2026-10-18
 - **Commits:** `83efc56` — "Phase 0: repository and build foundation"

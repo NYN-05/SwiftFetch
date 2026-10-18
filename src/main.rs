@@ -1,32 +1,28 @@
-//! `download-manager` — Windows-first command-line download manager.
+//! Windows-first CLI download manager.
 //!
-//! Phase 0 (repository and build foundation): the executable starts and exits
-//! predictably. Download commands and the shared modules (configuration,
-//! errors, logging) are introduced by later phases per `DOCS/phases.md`.
+//! The binary is a thin layer: it parses the CLI contract, installs
+//! diagnostics, and dispatches to the application entry point, mapping
+//! typed errors to documented exit codes. All transfer, storage, and
+//! archive behavior lives in modules introduced by later phases
+//! (`DOCS/phases.md`).
 
-/// Composes the startup banner so the entry point is reachable and testable.
-fn banner() -> String {
-    format!(
-        "{} {} (Phase 0 foundation build)",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
-    )
-}
+use clap::Parser;
+
+mod app;
+mod cli;
+mod config;
+mod error;
+mod logging;
 
 fn main() {
-    println!("{}", banner());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::banner;
-
-    #[test]
-    fn banner_names_the_application() {
-        assert!(
-            banner().starts_with("download-manager"),
-            "banner should identify the application crate: {:?}",
-            banner()
-        );
-    }
+    let cli = cli::Cli::parse();
+    logging::init(cli.verbose);
+    let exit_code = match app::run(&cli) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("error: {err}");
+            err.category().exit_code()
+        }
+    };
+    std::process::exit(exit_code);
 }

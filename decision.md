@@ -34,6 +34,7 @@ only by the project owner.
 | ADR-0006 | Edition 2021 pinned; `rustfmt.toml` mirrors it | Accepted |
 | ADR-0007 | Repo hygiene: `.gitignore`, `.gitattributes`, tracked `Cargo.lock` | Accepted |
 | ADR-0008 | Canonical verification recipe: fixed check sequence + fresh-clone reproduction | Accepted |
+| ADR-0009 | Phase 1 CLI contract: honest unwired commands, exit codes 0/1/2, tracing-to-stderr logging, URL redaction | Accepted |
 
 ---
 
@@ -147,7 +148,9 @@ only by the project owner.
 
 ## ADR-0005 — Phase 0 entry point: banner + unit test in the binary crate, integration test via `CARGO_BIN_EXE`; no `lib.rs` yet
 
-- **Status:** Accepted
+- **Status:** Superseded (banner contract and Phase 0 test set replaced by the
+  Phase 1 CLI contract — see ADR-0009). The `CARGO_BIN_EXE_*` integration-test
+  technique itself is retained and extended.
 - **Date:** 2026-10-18
 - **Context:** Phase 0 requires that the default executable "starts and exits
   predictably" plus "a basic unit or smoke test proving the application crate
@@ -251,3 +254,68 @@ only by the project owner.
   Phase 0's single-crate size; re-evaluate if it ever becomes material). The
   recipe must be mirrored in `README.md` and referenced from phase handoffs so
   the documented truth and the executed truth stay the same.
+
+---
+
+## ADR-0009 — Phase 1 CLI contract: honest unwired commands, exit codes 0/1/2, tracing-to-stderr logging, URL redaction rule
+
+- **Status:** Accepted (supersedes the banner-specific parts of ADR-0005)
+- **Date:** 2026-10-18
+- **Context:** Phase 1 requires a Clap-based CLI (download input, URL-list
+  input, status, resume, retry plus configuration options), central
+  configuration types, typed errors with stable categories, `tracing`-
+  based structured logging with concise default output, and early validation
+  of obviously invalid inputs — while commands may not falsely report
+  success and must be "explicitly marked unavailable during development."
+- **Decision:**
+  1. *CLI surface (clap 4 derive):* subcommands `download` (positional URLs,
+     `--url-file`, `--output`, `--files`, `--segments`, `--retries`,
+     `--no-extract`), `status`, `resume`, `retry`; global `--verbose`.
+     Help text labels every command as unwired; developer intent never
+     leaks into user help (long_about pinned).
+  2. *Exit codes:* `0` success; `1` requested operation cannot proceed —
+     including any Phase 1 "not implemented" dispatch; `2` invalid
+     invocation/configuration (Clap parse failures map to 2 natively, as do
+     all `ErrorCategory::Input` rejections).
+  3. *Errors (thiserror):* full `ErrorCategory` taxonomy from architecture
+     §12 with stable kebab-case ids; `AppError` renders only the
+     user-facing message, keeping internal source chains out of default
+     output. `retries = 0` is accepted (means no retries); concurrency
+     options must be ≥ 1; output paths must be non-empty, NUL-free, valid
+     Unicode.
+  4. *Logging:* tracing-subscriber writes to **stderr** (stdout reserved for
+     results/progress); default INFO, `--verbose` DEBUG. `redact_url` is the
+     mandatory log-safety rule: query *and* fragment are dropped wholesale
+     (tokens cannot be reliably classified), userinfo passwords are masked;
+     bare usernames pass through.
+  5. *Test plumbing:* integration tests keep running the real binary via
+     `CARGO_BIN_EXE_*`; the Phase 0 banner smoke test was *replaced* — not
+     weakened — because the banner contract was deliberately superseded
+     (this phase defined the replacement in the same commit).
+- **Alternatives considered:**
+  1. Hide unwired subcommands from help until their phases — rejected: the
+     phase instructs to define the command surface now; hiding would make
+     help less truthful about the intended product.
+  2. `env_logger` — rejected: architecture §3 mandates `tracing`.
+  3. `assert_cmd` for integration tests — deferred: `std::process::Command`
+     over `CARGO_BIN_EXE_*` covers the process-level contract without an
+     extra dev-dependency; revisit if tests need stdin/env control.
+  4. Full URL parsing now (e.g. `url` crate) — deferred: Phase 1 validation
+     is intentionally scheme-level "obvious invalid input"; deep parsing
+     belongs to the HTTP phases, so no extra dependency yet.
+  5. Selective query-param redaction (allowlist/denylist of keys) —
+     rejected: classification of unknown remote query parameters is exactly
+     the guesswork that could leak tokens; wholesale removal is the only
+     conservative rule.
+  6. Omit unwired taxonomy/categories until used — rejected: Phase 1's own
+     test list requires stable error categories now; instead, narrow
+     `allow(dead_code)` waivers (each citing its future phase) bridge the
+     gap, keeping `-D warnings` meaningful.
+- **Tradeoffs:** Every command is defined but does nothing yet (honesty in
+  help + stderr is the mitigations). Config defaults exist twice — as the
+  authoritative defaults in `AppConfig` and as help text; a test locks the
+  mapping so drift fails loudly. Exit-code table is provisional until
+  Phase 11 documents it fully (0/1/2 already stable and tested). Clap parse
+  errors and validation errors share exit code 2 by design.
+- **Related:** ADR-0003 (deps onboarded at first use), ADR-0005
+  (superseded banner), ADR-0008 (verification recipe).

@@ -1,11 +1,14 @@
 [package]
 name = "download-manager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Windows-first command-line download manager"
 publish = false
 
-# Phase 0: no runtime dependencies yet. Stack dependencies (Tokio, Reqwest,
-# Clap, SQLite, ZIP, tracing) are added only when their phases first use them,
-# per DOCS/phases.md Phase 0.
+# Phase 1 introduces the CLI shell, configuration, errors, and logging.
+# Stack crates are added only when a phase first uses them (DOCS/phases.md).
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
