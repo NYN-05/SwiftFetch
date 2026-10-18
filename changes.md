@@ -883,6 +883,24 @@ with the three integration targets (11 cli, 15 fixtures, 24 mock_server).
 - New schema migrations are contract-risky: they must append to
   `MIGRATIONS` (never rewrite) with the phase's tests, per ADR-0017.
 
+### Phase 5 verification addendum (post-commit, appended 2026-10-18)
+
+- **Commit:** `b5da4d2` - "Phase 5: SQLite persistence and lifecycle state
+  (v0.7.0)" (code + tests + tracking files, 7 files changed, 2657
+  insertions(+), 8 deletions(-)). The phase entry above is part of that
+  commit, so the hash is recorded here and in `git log`, not inside the
+  entry itself (same honesty rule as the Phase 1-4 entries).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `b5da4d2` to a fresh temp directory on Windows - the clone was removed
+  after the run; working tree verified clean before the recipe - run in
+  order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 22.2 s check) |
+| `cargo test` | 184 passed, 0 failed (134 unit + 11 cli + 15 fixtures + 24 mock_server), identical to the working-tree run |
+
 
 
 
