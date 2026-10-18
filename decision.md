@@ -753,5 +753,172 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0016 | Phase 4 naming and finalization: sanitized effective-URL names, engine-owned partials, no-overwrite reserve-and-rename | Accepted |
 
+## ADR-0017 - Phase 5 SQLite persistence: rusqlite (bundled), single-writer repository, local app-data database, migration protocol
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** Phase 5 makes SQLite the source of truth for queue and
+  recovery metadata (`DOCS/architecture.md` §9). The approved stack names
+  "SQLite" and "a maintained Rust SQLite crate" without a concrete version;
+  the database must live in the user's local application-data directory,
+  separate from any download directory; the schema must be versioned from
+  the first persisted release; the database registers metadata only — never
+  file contents.
+- **Decision:**
+  1. **Crate:** `rusqlite 0.40` with the `bundled` feature (the SQLite
+     engine itself compiles into the binary via `libsqlite3-sys`; no system
+     SQLite library is required, keeping Windows builds reproducible).
+     rusqlite is the long-maintained, conventional Rust SQLite wrapper; it
+     is a sync API.
+  2. **Connection architecture:** one SQLite connection per repository,
+     serialized behind a `std::sync::Mutex` ("a controlled database-writer
+     path is sufficient for this single-user application", §9). Operations
+     are short; connection-level pragmas: `journal_mode = WAL`,
+     `foreign_keys = ON` (SQLite defaults it off; the record tables rely on
+     it), and `busy_timeout = 5 s` for cross-process contention only.
+     `synchronous` is left at SQLite's FULL default: the durability of
+     recovery metadata matters more than its write microspeed.
+  3. **Repository law:** every public operation runs entirely within the
+     call and commits before returning; there is no API that keeps a
+     transaction open across a callback, a network transfer, or a file
+     write. Multi-statement logical writes (status validation + update,
+     record existence + update) run inside one
+     `TransactionBehavior::Immediate` transaction every time; single-statement
+     writes are atomic on their own. A panic inside any operation poisons
+     the mutex, and later operations fail honestly rather than wrapping
+     parallel work around damaged state.
+  4. **Location:** `%LOCALAPPDATA%\SwiftFetch\swiftfetch.sqlite3` on
+     Windows (the platform SwiftFetch treats as first-class). A missing or
+     empty `LOCALAPPDATA` is a typed `Filesystem` failure with an
+     actionable message - SwiftFetch refuses to guess a fallback location
+     and silently write elsewhere. The parent directory is created when
+     missing; an inaccessible location fails as "filesystem" naming the
+     path.
+  5. **Migration protocol:** an ordered `MIGRATIONS` list starting at
+     generation 1; each entry applies its DDL plus the `schema_version`
+     bookkeeping write inside one immediate transaction, so a fresh
+     database that fails initialization stays completely empty and re-runs
+     cleanly, and a partially applied generation never exists. A database
+     claiming a generation newer than this build is refused outright
+     ("update SwiftFetch or restore a compatible database"), never
+     downgraded or guessed at.
+  6. **Metadata-only law:** the record tables (`downloads`, `segments`,
+     `extractions`) carry metadata columns only; a test enumerates
+     `PRAGMA table_info` for every table and requires zero BLOB-typed
+     columns, so downloaded file contents structurally cannot enter the
+     database. Child tables reference `downloads(id)` with
+     `ON DELETE CASCADE` so a later queue-cleanup phase cannot strand
+     orphan segments/extractions.
+- **Alternatives considered:**
+  1. **`sqlx` (async, what the runtime runs)** - rejected: far heavier
+     (async runtime integration, proc-macro query surface, more crates) for
+     a workload that is short local statements behind one writer; nothing
+     in the phase needs async database calls.
+  2. **Depend on a system `sqlite3` / dynamic linking** - rejected: breaks
+     reproducible Windows builds and clean-clone verification, and makes
+     behavior depend on which SQLite each OS exposes.
+  3. **PRAGMA `user_version` instead of a `schema_version` table** -
+     rejected: the architecture names a `schema_version` table; that is the
+     recorded contract (§9), not swappable in phase.
+  4. **Caller-owned transactions (open/close handles returned to callers)** -
+     rejected: it invites holding transactions across network or file work,
+     which phase 5 forbids explicitly ("do not hold a database transaction
+     open during network transfers or long file writes").
+- **Consequences:**
+  - The repository is `pub(crate)` and unwired until a later phase uses it
+    (Phase 6 transfer records, Phase 7 queue, Phase 11 commands); the
+    phase-standard file-level waiver cites that.
+  - `created_at`/`updated_at` are caller-supplied unix-seconds stamps, so
+    recovery phases stamp consistently and tests stay deterministic.
+  - Out-of-range values (u64 beyond i64, inverted ranges, over-claimed
+    progress) are rejected as owned before any write; persisted names that
+    fail to parse on read (unknown status/category/state text, negative
+    counts) are typed `Database` failures, never silently defaulted.
+  - Multi-process contention is bounded by `busy_timeout`, but there is no
+    cross-process simultaneous-writer test in this phase (disclosed in
+    `changes.md`).
+- **Related:** ADR-0003 (first-use), ADR-0018 (lifecycle graph),
+  `DOCS/architecture.md` §3/§9, `changes.md` Phase 5 entry.
+
+### Addendum-index extension (ADR-0017 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0017 | Phase 5 SQLite persistence: rusqlite bundled, single-writer repository, local app-data location, atomic migrations | Accepted |
+
+## ADR-0018 - Phase 5 download lifecycle graph: validated transitions at the storage boundary
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** `DOCS/architecture.md` §7 lists ten lifecycle states and
+  requires "state transitions must be validated by the application layer",
+  with download completion and extraction completion as separate outcomes.
+  Phase 5 defines the explicit, validated transition graph before resume
+  (Phase 6) and scheduling (Phase 7) can drive it; commands remain unwired
+  until Phase 11.
+- **Decision:** The truth table, tested for all 100 `(from, to)` pairs
+  (`DownloadState::allows`):
+  - edges: `queued → probing, cancelled`; `probing → downloading, failed,
+    cancelled`; `downloading → finalizing, retrying, paused, failed,
+    cancelled`; `paused → downloading, cancelled`; `retrying → downloading,
+    paused, failed, cancelled`; `finalizing → completed, failed`;
+    `completed → extracting; extracting → completed`; `failed` and
+    `cancelled` are terminal.
+  - `update_status` validates and writes inside one immediate transaction:
+    the record must exist, the target must differ from the current state
+    (a no-transition write is an error, not a silent success), and the edge
+    must be permitted; a rejected request changes nothing.
+  - **Error-category policy:** entering `failed` *requires* a category;
+    entering any other state *rejects* one. The column keeps one sharp
+    meaning: why this download failed. Transient errors during
+    `retrying`/`paused` carry no download-status category (their
+    diagnostics log at the engine; the retry policy that would use them
+    lands with Phase 6).
+  - **Extraction is not download completion:** the download goes
+    `completed → extracting → completed` while the `extractions` table
+    records the extraction's own states, details, and failures. A
+    successfully downloaded file never flips to `failed` because its
+    extraction failed ("a file can be successfully downloaded while
+    extraction fails", §7).
+  - **Terminality:** `failed` may not re-route (the Phase 11 `retry`
+    command will get its requeue edge by an explicit, tested decision when
+    that phase arrives); `cancelled` is final and never reached after
+    `finalizing` (the atomic rename lands in `completed`/`failed`; forced
+    termination between the two is a startup-reconciliation case, not a
+    status transition).
+  - Extraction/segment states exist for persistence now but have no
+    transition graph until their phases (8 and 10).
+- **Alternatives considered:**
+  1. **`completed → failed` allowed** - rejected: contradicts §7's complete
+     ⟂ extraction-failure separation and risks erasing a good file's
+     status.
+  2. **`probing → paused` / `queued → failed` / other speculative edges** -
+     rejected: pause takes effect at transfer/retry boundaries (Phase 7
+     scheduling semantics), and input rejected before a record exists never
+     becomes a failed download. Each later phase that needs an edge adds
+     exactly that edge with its test, under this recorded contract.
+  3. **Category recorded on every transition** - rejected: blurs the column
+     into a general "last error" log; recovery would then need to guess
+     whether a non-failed download actually failed.
+  4. **State transitions outside transactions** - rejected: read-validate-
+     write as one unit is the phase's explicit "transactions for changes
+     that must be consistent" requirement.
+- **Consequences:**
+  - The truth table is part of the project contract: an edge may be added
+    only with its owning phase's tests, never silently.
+  - Corruptly stored status texts, categories, or negative numbers fail
+    as typed `Database` errors on read (unknown names are refused with
+    "the file may be corrupt or belong to another program" phrasing).
+  - Honest reads: `get_download` of an unknown id is `None`; update
+    operations of unknown ids are typed not-found failures.
+- **Related:** ADR-0017 (repository), `DOCS/architecture.md` §7,
+  `changes.md` Phase 5 entry.
+
+### Addendum-index extension (ADR-0018 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0018 | Phase 5 lifecycle graph: 20 tested edges, category policy, extraction stays separate from completion | Accepted |
+
 
 

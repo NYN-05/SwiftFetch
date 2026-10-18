@@ -1,6 +1,6 @@
 [package]
 name = "swift-fetch"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
@@ -21,6 +21,11 @@ bytes = "1"
 # transfer timeouts (time), partial-file streaming (fs, io-util). Runtime
 # bootstrap features stay in later phases per first-use (ADR-0003).
 tokio = { version = "1", default-features = false, features = ["fs", "io-util", "time"] }
+# Phase 5: SQLite queue/recovery metadata (architecture §9). "bundled"
+# compiles the SQLite engine itself, so no system SQLite library is needed
+# and Windows behavior is reproducible; metadata only — the database never
+# stores downloaded file contents.
+rusqlite = { version = "0.40", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

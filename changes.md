@@ -744,6 +744,145 @@ storage::file_writer 6 - together with the three integration targets
 | `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 23.4 s check) |
 | `cargo test` | 158 passed, 0 failed (108 unit + 11 cli + 15 fixtures + 24 mock_server), identical to the working-tree run |
 
+## Phase 5 - SQLite Persistence and Lifecycle State
+
+- **Date:** 2026-10-18
+- **Version:** `0.6.0` → `0.7.0`
+- **Outcome:** Phase 5 exit gate met (working tree). Queue and recovery
+  metadata now persist in SQLite per the architecture's minimal model: a
+  versioned schema with an atomic migration protocol (fresh databases are
+  built in one transaction; failed initialization leaves generation 0 and
+  re-runs cleanly; a database from a newer SwiftFetch is refused, never
+  downgraded), a repository API for inserting/reading/updating/listing
+  download, segment, and extraction records, and the ten-state download
+  lifecycle with a fully tested transition graph. Downloads, segments, and
+  extractions are metadata only - the database structurally cannot store
+  file contents (no BLOB columns, test-locked). Every CLI command still
+  dispatches an honest not-implemented error (wiring is Phase 11; the
+  repository earns its production callers with Phase 6/7). No retry policy,
+  no segmented transfers, no extraction work (their own phases).
+
+### Dependencies added (approved stack, first use)
+
+`rusqlite 0.40.2` with `features = ["bundled"]` - the first use of the
+stack's SQLite component (ADR-0003 discipline, ADR-0017 record). `bundled`
+compiles the SQLite engine itself via `libsqlite3-sys 0.38.2`, so no system
+SQLite library is required and Windows builds stay reproducible. `git diff
+--stat Cargo.lock`: `93 insertions(+), 5 deletions(-)` - the lock gains the
+crates the SQLite integration resolves (rusqlite, libsqlite3-sys, hashlink,
+hashbrown, foldhash, fallible-iterator, fallible-streaming-iterator,
+sqlite-wasm-rs, rsqlite-vfs) plus the `swift-fetch` version line change.
+Dev-dependencies unchanged from Phase 2/3.
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | version `0.7.0`; `[dependencies]` gains `rusqlite = { version = "0.40", features = ["bundled"] }` with the first-use comment (ADR-0003) |
+| `Cargo.lock` | committed, diff above; `rusqlite 0.40.2` + `libsqlite3-sys 0.38.2` resolved |
+| `src/storage/schema.rs` | NEW. The versioned schema and its migration protocol (ADR-0017): the ordered `MIGRATIONS` list (generation 1 = the architecture's four minimal tables `downloads`/`segments`/`extractions`/`schema_version`; child tables reference `downloads(id)` with `ON DELETE CASCADE`); `migrate_connection` applies every pending migration each inside its own immediate transaction together with the `schema_version` write, so a fresh database that fails initialization stays completely empty and re-runs cleanly, a partially applied generation can never exist, and a database claiming a newer generation than the build supports is refused with an actionable `Database` error; `version_of` reads the recorded generation (no table = generation 0); fixed explicit column projections (`DOWNLOAD_COLUMNS`/`SEGMENT_COLUMNS`/`EXTRACTION_COLUMNS`) shared with the repository's positional row mappers; shared `db_failure` mapping (operation text + hidden source, always `ErrorCategory::Database`). 8 inline tests: migration-list well-formedness, fresh-database init to the current version, idempotent reopen (records survive), future-version refusal, failed-migration full rollback + clean re-run, failed fresh initialization stays empty, no-BLOB-columns across all tables, typed rejection visibility through rusqlite's conversion-failure wrapper |
+| `src/storage/repository.rs` | NEW. The repository (ADR-0017/0018): `DownloadState` (the ten architecture §7 states with `as_str`/`parse` and the ADR-0018 `allows` graph), `SegmentState`/`ExtractionState` (persistence round-trip now, transition graphs in phases 8/10), record structs (`DownloadRecord`/`SegmentRecord`/`ExtractionRecord` with `PartialEq` for test equality) and input specs (`NewDownload` always inserts `queued` - nothing truthful has happened yet; `TransferFacts` merge semantics: `None` fields keep their stored value); `default_database_path`/`database_path_in` (pure, testable resolution to `%LOCALAPPDATA%\SwiftFetch\swiftfetch.sqlite3`; missing/empty = typed `Filesystem` error, no fallback guessing); `Repository::open(path)` (parent-dir creation as `Filesystem` errors, connection pragmas: WAL + foreign_keys ON + 5 s busy timeout, then migrations); the complete CRUD surface - insert/get/list (all + per-status)/`update_status` (validated inside one immediate transaction)/`update_transfer_facts` (COALESCE merge)/`set_retry_count`/segment insert/update/list/extraction insert/update/get/list; value guards (u64→i64 range for byte counts/counts/timestamps, inverted-range and over-claimed-progress rejections) and read guards (negative numbers, unknown status/category/state text → typed `Database` failures that never silently default); `WriteFailure` enum so domain rejections roll their transaction back while rusqlite errors map through `db_failure`. 18 inline tests covering every phase 5 test requirement: persistence between program runs (+ unknown id reads `None`), full field round-trip, the ten-edge happy walk through the graph, the complete 100-pair truth table, atomic rejection of invalid/self/leap transitions (row untouched), failed-category requirement + no-categories-elsewhere, terminality of `failed`/`cancelled`, listing order + status filter, corrupt persisted names and negative values as typed errors, commit-before-return visibility from a second independent connection (the "no long-lived transaction across other work" proof), caller-supplied timestamps, segment round-trip/progress guards, FK enforcement for orphan children, extraction state/details tracking incl. failed-requires-details and clearing, all-update-methods not-found rejections, default-path derivation (pure + platform smoke), and the blocked-directory `Filesystem` error |
+| `src/storage/mod.rs` | declares `repository` and `schema`; module docs state the storage-layer laws (metadata-only database, local app-data placement, ADR references) |
+
+### Behavior contract (Phase 5)
+
+- `versioning law`: the schema generation is recorded in `schema_version`;
+  migrations run in order, each atomic with its version write; a newer
+  database file refuses to open; existing generations are never rewritten
+  (new migrations append to `MIGRATIONS`).
+- `state law` (ADR-0018): a download record moves only along the tested
+  graph; `update_status` validates existence, no-op, and edge inside the
+  same immediate transaction that writes, so an invalid request writes
+  nothing; `failed` requires an error category and other states reject one;
+  extraction lives in its own table (`completed ⇄ extracting` round trip on
+  the download, failures never downgrade the downloaded file's status).
+- `transaction law`: every repository operation commits before returning;
+  no public API holds a transaction across a callback, network transfer, or
+  file write; the "writes are visible to an independent connection the
+  moment the method returns" test is the observable proof.
+- `metadata-only law`: no BLOB-typed columns exist in any table
+  (test-enumerated); bytes never become database content.
+- `honesty law`: unknown ids read as `None` on get and fail as typed
+  not-found errors on update; unreadable persisted data (foreign status
+  text, unknown categories, negative numbers) fails with typed `Database`
+  errors naming the corruption, never silently masked.
+- `path law`: the database lives under the local application-data directory
+  (`%LOCALAPPDATA%\SwiftFetch\swiftfetch.sqlite3`), separate from any
+  download directory; missing/empty `LOCALAPPDATA` and inaccessible
+  directories are typed failures with actionable messages.
+
+### Defects caught before commit (recorded honestly)
+
+1. **rusqlite 0.40 API drift vs older samples:** `Connection::table_exists`
+   takes a schema-name parameter first (`table_exists(Option<N>, N)`) - the
+   one-arg form existed in older docs. Caught by `cargo build --tests`
+   (E0061 + E0600) and fixed across all five call sites.
+2. **Domain rejections inside transaction bodies needed their own carrier:**
+   the first draft threaded rusqlite's `Result` through validation paths,
+   which would either lose the typed message or misuse conversion-failure
+   constructors for business logic. Resolved with the two-variant
+   `WriteFailure` enum (`Sql(rusqlite::Error)` / `Rejected(AppError)`) plus
+   `From` conversions, so domain rejections roll the transaction back with
+   their typed message intact and SQL errors map through `db_failure`.
+3. **Compiler-caught category/type mismatches in the same iteration** (e.g.
+   `rejection()` used at function scope where an `AppError` was required in
+   `update_extraction`): fixed to plain `AppError::new` at scope, keeping
+   `rejection()`/`not_found` carriers only inside transaction closures.
+4. Mechanical `cargo fmt` reflows after the first successful compile; no
+   semantic change.
+
+### Verification - actual results (all run on Windows)
+
+Working tree, in the ADR-0008 order:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (after one `cargo fmt` round; re-run clean) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (three lint fixes: `match_like_matches_macro` on the transition graph → `matches!`, two `explicit_auto_deref` removals on the lock guards) |
+| `cargo test` | **184 passed, 0 failed** = 134 unit (108 Phase 4 baseline + storage/repository 18 + storage/schema 8) + 11 cli + 15 fixtures + 24 mock_server |
+
+Observed totals (per-module, `--list`): app 3, cli-in-binary 9,
+common::fixture 6, config 7, download::http 4, download::probe 37,
+download::progress 1, download::sequential 25, error 5, logging 5,
+storage::file_writer 6, storage::repository 18, storage::schema 8 - together
+with the three integration targets (11 cli, 15 fixtures, 24 mock_server).
+
+- The CLI behavior contract is untouched and still locked by its Phase 1
+  tests (commands print the not-implemented line to stderr, exit 1, empty
+  stdout; parse/config rejects are exit 2; logging goes to stderr only).
+- The ADR-0014 double-count disclosure still applies: the six common
+  fixture inline tests run in multiple targets, so 184 (and 134) count them
+  multiple times.
+- Windows honesty: every check in the table ran on Windows (MSVC, rustc
+  1.99.1); nothing was verified on another platform, and nothing is
+  presented as Windows proof that wasn't.
+- `dead_code` waivers: file-level in the two NEW modules
+  (`src/storage/schema.rs` and `src/storage/repository.rs`), each citing
+  the phases that wire them (Phase 6/7 onward, commands in Phase 11);
+  nothing else was suppressed.
+- Disclosed limitations, honest for this phase: no cross-process
+  simultaneous-writer test exists (multi-process contention is bounded by
+  `busy_timeout` but unexercised); the repository has no production caller
+  yet (the not-implemented commands remain the CLI surface, per plan);
+  crash-between-filesystem-write-and-DB-commit recovery semantics arrive
+  with Phase 6's recovery protocol (Phase 5 ensures the DB side of that
+  boundary is transactional and visible);
+  segment/extraction lifecycle validation is deferred to their phases (8,
+  10) by design.
+
+### Scope-control notes
+
+- No retry policy, no resume, no segment scheduling, no extraction work, no
+  GUI, no telemetry - later phases per `DOCS/phases.md`.
+- The repository is not wired to commands or the engine: like Phase 4's
+  engine, it is a tested layer whose callers arrive in Phase 6 (transfer
+  records + recovery), Phase 7 (queue), and Phase 11 (status/retry
+  commands).
+- The `failed → queued` edge (manual retry requeue) is deliberately absent;
+  Phase 11's retry command adds it with its own tests under ADR-0018.
+- New schema migrations are contract-risky: they must append to
+  `MIGRATIONS` (never rewrite) with the phase's tests, per ADR-0017.
+
 
 
 
