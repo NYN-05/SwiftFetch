@@ -1094,6 +1094,25 @@ storage::schema 8 (Phase 5 baseline 134 → 178).
 - Tracking files: both appends observe ADR-0010 (append-only at the very
   bottom; supersession by reference, never rewording).
 
+### Phase 6 verification addendum (post-commit, appended 2026-10-19)
+
+- **Commit:** `cbdb953` - "Phase 6: Single-file resume, retry, and restart
+  recovery (v0.8.0)" (code + tests + tracking files, 14 files changed,
+  4209 insertions(+), 39 deletions(-)). The phase entry above is part of
+  that commit, so the hash is recorded here and in `git log`, not inside
+  the entry itself (same honesty rule as the Phase 1-5 entries).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `cbdb953` to a fresh temp directory on Windows - the clone was removed
+  after the run; working tree verified clean before the recipe apart from
+  the owner's own unstaged `AGENTS.md` doc edit, which is not part of the
+  phase - run in order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 29.3 s check) |
+| `cargo test` | 228 passed, 0 failed (178 unit + 11 cli + 15 fixtures + 24 mock_server), identical to the working-tree run (unit target 177.9 s cold) |
+
 
 
 
