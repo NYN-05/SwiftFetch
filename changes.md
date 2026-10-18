@@ -385,5 +385,21 @@ never linked into the product binary (see ADR-0013). `Cargo.lock` committed.
 - Unmounted routes answer the 404 sentinel by design, so route typos in
   later tests can never silently serve fixture bytes.
 
+### Phase 2 verification addendum (post-commit, appended 2026-10-18)
+
+- **Commit:** `a5c0ce8` — "Phase 2: controlled HTTP test infrastructure
+  (v0.4.0)" (code + tests + tracking files). The entry above and its hashes
+  are part of that commit, so the hash is recorded here and in `git log`,
+  not inside the entry itself (same honesty rule as the Phase 1 entry).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `a5c0ce8` to a fresh temp directory on Windows, working tree verified
+  clean, recipe run in order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
+| `cargo test` | 79 passed (29 unit + 11 cli + 15 fixtures + 24 mock_server), 0 failed |
+
 
 
