@@ -1,6 +1,6 @@
 [package]
 name = "swift-fetch"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
@@ -13,6 +13,14 @@ publish = false
 # transparent content transform would invalidate byte-range offsets, and
 # Phase 3 must record only facts the responses actually support.
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "http2"] }
+# Phase 4: the body-streaming type of reqwest's public API (Response::chunk
+# yields bytes::Bytes). reqwest already pulls this crate, so the tree gains
+# nothing new; it only becomes *directly named* by engine code.
+bytes = "1"
+# Phase 4: the sequential transfer engine is async production code — bounded
+# transfer timeouts (time), partial-file streaming (fs, io-util). Runtime
+# bootstrap features stay in later phases per first-use (ADR-0003).
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "time"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

@@ -14,6 +14,7 @@ mod config;
 mod download;
 mod error;
 mod logging;
+mod storage;
 
 /// Phase 3 test-support include: the binary's own unit tests (e.g. the
 /// network-bound tests in `src/download/probe.rs`) reuse the controlled

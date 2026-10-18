@@ -606,5 +606,152 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0014 | Phase 3 unit tests reuse `tests/common` via `cfg(test)` include | Accepted |
 
+## ADR-0015 - Phase 4: sequential transfer timeout policy - engine-side phase bounds instead of a client-level overall cap
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** Phase 4 streams resources whose bodies may be arbitrarily
+  large, while connect-through-headers must stay bounded and an idle
+  (stalled) server must be detected. The Phase 3 `HttpClient` carried a
+  provisional client-level overall timeout (30 s). A client-level reqwest
+  timeout applies to the *whole* request including the body, so as a cap it
+  would abort every legitimate long download's transfer, and as a raised
+  number it would leave the header phase effectively unbounded. Empirical
+  facts (verified against reqwest 0.12.28 before implementation):
+  `RequestBuilder::timeout` accepts a plain `Duration` - there is no
+  per-request way to clear or override the client default - and reqwest
+  offers no per-request `read_timeout`, so "bounded ask, unbounded body"
+  cannot be expressed through reqwest's own knobs.
+- **Decision:** Keep the one-client law; move the time bounds to the
+  engine, applied per phase:
+  - `HttpTimeouts { connect, metadata, body_idle }` (defaults 15 s / 30 s /
+    30 s, locked by a unit test). The former `overall` field is replaced by
+    `metadata` + `body_idle`.
+  - No client-level `.timeout()` anymore (this supersedes the Phase 3
+    provisional-overall note in `http.rs`'s documentation).
+  - `HttpClient::send` wraps the request future in
+    `tokio::time::timeout(metadata)`: it bounds connecting, the redirect
+    chain, and response-header arrival. The elapsed arm produces the same
+    user-facing shape the Phase 3 tests lock:
+    `the remote server did not answer in time: {redacted}`.
+  - New `HttpClient::read_chunk(&self, &mut Response)` wraps each
+    `response.chunk()` in `tokio::time::timeout(body_idle)`: every body
+    read must make progress within the idle window, while the total body
+    duration is deliberately unbounded (large downloads are legitimate).
+    The elapsed arm produces
+    `the remote server stopped sending data during the transfer: {redacted}`.
+  - reqwest's own `connect_timeout` stays the client-side knob; connect
+    failures still surface through `http_error`'s `is_timeout` branch with
+    the same user message as in Phase 3.
+- **Alternatives considered:**
+  1. **Keep a client-level overall cap** - rejected: it bounds the body
+     (the transfer would die mid-stream at the cap) or, if raised, leaves
+     the header phase unbounded; neither matches the phase contract.
+  2. **Per-request `.timeout(Duration)`** - rejected: a per-request timeout
+     is also an overall future bound (bodies included); it cannot express
+     "bounded metadata exchange, unbounded body with bounded idleness".
+  3. **Idle watchdogs / instrumentation around reqwest's internals** -
+     rejected: significant complexity for the first use case; reqwest
+     exposes no per-request read timeout to hang such logic on.
+- **Consequences:**
+  - `tokio` becomes a product dependency with
+    `features = ["fs", "io-util", "time"]` (first use in Phase 4, per
+    ADR-0003's first-use discipline; runtime/bootstrap features stay out
+    until a phase needs them). `bytes` becomes a direct dependency because
+    `Response::chunk` yields `bytes::Bytes` in its public API; reqwest
+    already pulled the crate, so the committed `Cargo.lock` gains zero new
+    packages (the diff is the version line only - verified with
+    `git diff --stat Cargo.lock`).
+  - `Progress`-independent policy lives in `HttpClient`; callers (prober,
+    engine) keep their own status/EOF handling.
+  - Total transfer duration is intentionally unbounded; stall detection is
+    strictly per read.
+  - Verification: the idle path is bounded and test-verified
+    (250 ms budget against a 900 ms stalled frame; both timing budgets are
+    mocked, not live).
+- **Related:** ADR-0003 (first-use), ADR-0008 (verification recipe),
+  `changes.md` Phase 4 entry.
+
+### Addendum-index extension (ADR-0015 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0015 | Phase 4 transfer timeouts: engine-side metadata/idle bounds, no client-level overall cap | Accepted |
+
+## ADR-0016 - Phase 4 destination naming and finalization policy
+
+- **Status:** Accepted
+- **Date:** 2026-10-18
+- **Context:** The reliability invariants forbid silently overwriting user
+  files and forbid finalizing incomplete data; the PRD makes Windows the
+  first-class platform (reserved names, illegal characters, per-component
+  path length); and a failed transfer must keep its diagnostics. Phase 4
+  needs a deterministic, honest name for a fetched resource and a
+  finalization order that cannot race into replacing user content.
+- **Decision:**
+  1. **Filename derivation** (engine, `select_filename` from the *effective*
+     URL): take the last non-empty path segment (the effective URL after
+     redirects names the resource that was actually fetched; the query
+     string never becomes the file name), percent-decode it manually per
+     segment (RFC 3986, no direct `url`-crate dependency), then sanitize
+     for Windows: invalid characters (`< > : " / \ | ? *`) and control
+     codes become `_`; trailing dots/spaces are stripped; reserved device
+     stems (`CON PRN AUX NUL COM1-9 LPT1-9`, case-insensitive, before any
+     extension) gain a `_` prefix; the result is capped at 255 UTF-16 code
+     units preserving the extension; results that collapse to empty
+     (including `.`/`..`) fall back to the constant `download`.
+     Decoded-before-sanitized order is mandatory: a decoded `/` or `\`
+     must never survive to the filesystem.
+  2. **Partial file** (storage layer, `PartialFile`):
+     `<name>.swiftfetch-<pid>-<seq>.part` - process id plus a per-process
+     one-up counter, so concurrent processes *and* future concurrent
+     transfers inside one process can never share a partial name. It is
+     created only after the transfer response proved to be content (HTTP
+     200, no content transform, size agreement), so refused responses
+     leave no filesystem trace. A leftover partial of a pid-reusing older
+     process is deliberately truncated-recreated inside the engine's own
+     namespace; anything outside `*.swiftfetch-*.part` is never touched.
+  3. **Finalization exactly once, only for validated content:**
+     `reserve_destination` claims the final name by exclusive creation
+     (`create_new`, which fails atomically if the name exists) across the
+     plain name and then `stem (n).ext` candidates (n from 1), each kept
+     within the 255-UTF-16-unit component limit (stem re-truncation,
+     extension preserved); `finalize` fsyncs the partial file and
+     same-directory `std::fs::rename`s it over the own empty reservation
+     (same directory ⇒ same volume, atomic). On rename failure the partial
+     data is preserved and the own 0-byte reservation is best-effort
+     removed; the documented microsecond race (another finalizer claims
+     the plain name in between) can only ever shuffle suffix numbering -
+     reservations are always empty, so no user content can be destroyed.
+  4. **Failure law:** incomplete or failed transfers never reserve a final
+     name; the partial file remains for the later recovery phase.
+- **Alternatives considered:**
+  1. **Timestamps or random tokens for fallback names** - rejected:
+     non-deterministic; the same URL would silently produce different
+     names across runs, and the deterministic `download` + `(n)` numbering
+     is test-locked behavior.
+  2. **Overwrite-by-default (a later `--force` could opt in)** - rejected
+     for Phase 4: it contradicts the standing never-overwrite invariant;
+     any such switch is a product-level decision of a later phase.
+  3. **Copy partial → final, then delete the partial** - rejected: doubles
+     I/O, and a crash between copy and delete leaves a stray extra file;
+     rename is atomic and moves the already-synced inode-equivalent.
+- **Consequences:**
+  - Repeated downloads of one URL land on deterministic siblings
+    `name`, `name (1)`, `name (2)`… (test-locked).
+  - The recovery phase (later phases) identifies engine partials by the
+    `*.swiftfetch-<pid>-<n>.part` suffix pattern.
+  - Windows-specific semantics (reserved stems, UTF-16 component cap,
+    `create_new` exclusivity, rename-over-empty-reservation) are validated
+    on Windows in this phase; nothing is claimed as verified elsewhere.
+- **Related:** ADR-0004 (modular layout), ADR-0008 (verification recipe),
+  PRD Windows-first file handling, `changes.md` Phase 4 entry.
+
+### Addendum-index extension (ADR-0016 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0016 | Phase 4 naming and finalization: sanitized effective-URL names, engine-owned partials, no-overwrite reserve-and-rename | Accepted |
+
 
 

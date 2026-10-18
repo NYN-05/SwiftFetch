@@ -544,6 +544,189 @@ Phase 2 dev-dependencies are shared, never leaked into the product build.
 | `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
 | `cargo test` | 124 passed (74 unit + 11 cli + 15 fixtures + 24 mock_server), 0 failed |
 
+## Phase 4 - Sequential Transfer Engine
+
+- **Date:** 2026-10-18
+- **Version:** `0.5.0` → `0.6.0`
+- **Outcome:** Phase 4 exit gate met (working tree). One-URL sequential
+  downloader implemented and network-tested against the Phase 2 mock
+  server: probe resolves the effective URL, the file name derives from the
+  effective URL and is sanitized for Windows, only an HTTP 200 response may
+  write bytes (error bodies never become file content), body chunks stream
+  through bounded/idle-aware reads into an engine-owned partial file, a
+  size claim when one exists is validated before finalization, and the
+  final name is claimed without ever replacing an existing file
+  (reserve-by-`create_new`, then same-volume rename). Failed transfers keep
+  their `.part` file and never produce a final name. Every CLI command
+  still dispatches an honest not-implemented error (wiring is Phase 11).
+  No segmented transfers, no retry policy, no SQLite, no ZIP work (their
+  own phases).
+
+### Dependencies added (approved stack, first use)
+
+Two product dependencies by ADR-0003 first-use discipline:
+
+- `tokio 1` with `default-features = false`,
+  `features = ["fs", "io-util", "time"]` - the engine is async production
+  code: partial-file streaming (`fs`, `io-util`) and engine-side bounded
+  timeouts (`time`, ADR-0015). Runtime/bootstrap features (rt, macros,
+  signal...) stay in `[dev-dependencies]` for tests and remain excluded
+  from the product build.
+- `bytes 1` - the body-streaming type of reqwest's public API
+  (`Response::chunk` yields `bytes::Bytes`), which `HttpClient::read_chunk`
+  returns. reqwest already pulled the crate, so adding the direct entry
+  changed **zero** package resolutions: `git diff --stat Cargo.lock` shows
+  `1 file changed, 1 insertion(+), 1 deletion(-)` - exactly the
+  `swift-fetch` version line to `0.6.0`.
+
+Dev-dependencies unchanged from Phase 2/3.
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | version `0.6.0`; `[dependencies]` gains `tokio` and `bytes` with first-use phase comments (ADR-0003) |
+| `Cargo.lock` | version-line-only diff (see above); committed per the standing rule |
+| `src/main.rs` | `mod storage;` wired (the Phase 0 placeholder module becomes load-bearing) |
+| `src/download/mod.rs` | declares `progress` and `sequential`; module doc states the transfer law and fixes the ADR-0014 path reference in prose to `../tests/common/mod.rs` (text only; the `#[path]` attribute lives in `main.rs` and was always correct) |
+| `src/download/progress.rs` | NEW. Wait-free byte counters of one transfer (`bytes_received`, `bytes_written`, `largest_single_write` atomics), `Progress::shared() -> Arc` so tests/later phases observe during *and* after failures (the caller owning the handle is deliberate: after a failed `download_sequential` no counters would otherwise be observable). The CLI-facing display remains later-phase work; waiver cites Phase 11. One inline test |
+| `src/download/http.rs` | ADR-0015. `HttpTimeouts { connect, metadata, body_idle }` (defaults 15 s/30 s/30 s, still locked by an updated unit test); the client-level `.timeout()` is removed entirely; `send()` wraps the request future in `tokio::time::timeout(metadata)` producing the same locked user message `the remote server did not answer in time: {redacted}`; NEW `read_chunk()` wraps each `response.chunk()` in `tokio::time::timeout(body_idle)` producing `the remote server stopped sending data during the transfer: {redacted}`; returns `bytes::Bytes`. Two new network tests: a body streaming across 8 delayed frames (~1.6 s) completes under a 250 ms metadata budget (header phase measured < the budget, body reads ≥ 800 ms), and a stalled second read aborts at the 250 ms idle budget with the recorded message |
+| `src/download/probe.rs` | Visibility bumps so the engine reuses ONE strict header-parsing/trust policy for its own transfer response (no second parser to drift): `response_meta()`, `ResponseMeta` (+ fields), `ContentEncoding`, `ContentLength` become `pub(crate)`; the `quick_client` test helper's `HttpTimeouts` literal covers the restructured fields |
+| `src/download/sequential.rs` | NEW. `download_sequential(client, url, output_dir, &Progress)` → `SequentialDownload`. Flow: `probe` the input URL (Phase 3 facts: size, validators, effective URL) → file name from the effective URL (`select_filename`: last non-empty path segment, manual per-segment percent-decode, Windows sanitization - invalid chars/control codes to `_`, trailing dots/spaces stripped, reserved device stems neutralized with a `_` prefix, 255 UTF-16-unit cap preserving the extension, constant `download` fallback for unusable results) → full GET through the shared client → require exactly `200` (anything else is `Http` with the probe-shaped message, before any file exists) → reuse `response_meta`: `Content-Encoding` transform refused as `RangeValidation` (nothing written, nothing created) → `expected_size_of`: the transfer's own `Content-Length` wins, the probe's recorded fact fills its absence, a contradiction between the two is refused (`RangeValidation`), no claim at all means the server-defined stream end is the completion criterion (no length invented) → only then create output dir + partial file → stream loop: bounded `read_chunk` + chunked `write_chunk`, counting received and written separately; mid-transfer failures are wrapped with the byte accounting (`stopped: {written} of {expected} expected bytes were written to the partial file; ...`) without hiding the cause or breaking log-safety → clean-end count validation (mismatch = `RangeValidation`, partial preserved) → `reserve_destination` + `finalize` (ADR-0016). The outcome record carries destination path, file name, bytes written, expected size, validators (final GET response wins over probe facts), effective URL. 25 inline tests: 9 pure filename tests, 2 pure size-decision tests, 14 network tests (byte-exact small + 4 MiB streamed transfer with counter checks, length-less stream-end completion, probe-fallback validation, truncation never finalizes with disk/counter agreement, 500 status never writes the sentinel body and leaves the directory untouched and uncounted, transformation refusal before any file, no-overwrite collision policy end-to-end, deterministic `(1)` siblings, missing output dir created, directory-occupied-by-file = `Filesystem`, GET-won validators, changing validators across downloads, redirect-effective-URL naming) |
+| `src/storage/file_writer.rs` | NEW. Storage-layer file law: `ensure_output_dir` (creates nested trees; a path held by a regular file is `ErrorCategory::Filesystem` naming the path); `PartialFile::create/write_chunk/sync` (`<name>.swiftfetch-<pid>-<seq>.part` - pid + per-process counter so concurrent processes and future intra-process transfers never share a name; single-component assert; tokio chunked writes); `reserve_destination` (exclusive `create_new` claim, `stem (n).ext` collision numbering from 1, 255 UTF-16-unit candidates via `with_suffix` stem re-truncation); `finalize` (sync, close handle, `std::fs::rename` over the own empty reservation; rename failure preserves the partial and best-effort removes the own 0-byte reservation - the microsecond race is documented and can only shuffle suffix numbering, never destroy content); exports `cap_units` + `MAX_COMPONENT_UNITS` (`pub(crate)`) reused by the engine's sanitizer. 6 inline tests |
+| `src/storage/mod.rs` | the Phase 0 doc-comment placeholder (ADR-0004) is replaced by the real module declaration plus storage-layer docs |
+
+### Behavior contract (Phase 4)
+
+- `request shape`: probe (≤ 2 requests) + one full GET = ≤ 3 requests per
+  download, all through the single configured client; the full GET never
+  carries a `Range` header.
+- `content law`: HTTP 200 is the only response shape whose body may become
+  file bytes; error statuses (and their bodies) leave the output directory
+  untouched and the counters at zero; a `Content-Encoding` transform is
+  refused before any file exists.
+- `size law`: with a claim (transfer `Content-Length`, else the probe's
+  recorded fact) the written byte count must equal it before
+  finalization; a contradiction between transfer and probe facts is an
+  error, never silently resolved; with no claim at all, stream end is the
+  completion criterion and `expected_size` records `None` honestly.
+- `failure law`: incomplete data never gains a final name; failures keep
+  the partial file; mid-transfer errors report how many bytes were written
+  vs expected (or unbounded) without leaking raw URLs; received and
+  written counters never drift from each other or from the partial file's
+  length on disk.
+- `destination law`: existing files are never replaced - deterministic
+  reservation `(n)` numbering on collision; the file name comes from the
+  effective URL (redirects included), percent-decoded then sanitized for
+  Windows (reserved device names, illegal/control characters, trailing
+  dots/spaces, 255-UTF-16-unit component cap with the extension preserved).
+- `time law` (ADR-0015): connect-through-headers is bounded
+  (15 s connect / 30 s metadata defaults); each body read is bounded by the
+  30 s idle default; total transfer duration is unbounded by design.
+- `progress`: received/written/largest-single-write counters are exact and
+  observable by the caller during and after the transfer.
+
+### Defects caught before commit (recorded honestly)
+
+1. **reqwest hands a small body over in ONE poll.** The Phase 2 mock
+   streams in 512-byte frames, but `Response::chunk()` empirically
+   returned the whole 4096-byte length-delimited body as a single chunk
+   (verified with a temporary disposable test, `tests/scratch_sizes.rs`,
+   output `[4096] total=4096`, file deleted after inspection). The
+   first draft asserted `largest_single_write < total` for the small
+   transfer and failed. The streaming-vs-buffering property is now proven
+   where it is meaningful: the 4 MiB transfer (a single poll cannot carry
+   a whole body through ~64 KiB-scale socket buffers), while the small
+   test locks counters and byte-exactness only. reqwest's poll size is its
+   own transport decision; the engine writes every poll immediately.
+2. **The mock's per-frame delay arms the sleep *after* handing out a
+   frame.** First draft assumed every frame slept before arriving and had
+   `an_idle_body_read_is_aborted_at_the_idle_budget` read the first chunk
+   expecting a stall: empirically frame 1 arrives free (~instantly) and
+   only the *next* poll waits the armed delay. The test now reads the free
+   first frame, then bounds the stalled *second* read (250 ms budget vs
+   900 ms armed delay) and locks the mapped message. Same semantics make
+   the streaming test's timing asserts phase-local with generous margins
+   (headers < budget; body reads ≥ 800 ms across 7+ armed sleeps) instead
+   of one brittle absolute end-to-end bound.
+3. **A truncated body poisons the pooled probe connection.** With
+   `truncate_after`, the probe's ranged request ends aborted (probe itself
+   ignores bodies, so probing succeeds); the subsequent full GET reuses
+   the dead pooled connection and the transport failure surfaces at the
+   *request* stage ("the request to the remote server failed: URL"),
+   before any byte or file exists. First draft asserted the mid-stream
+   accounting unconditionally and failed. The truncation test now accepts
+   both honest shapes: (a) failure before any body read - counters at 0,
+   no partial file, nothing finalized; (b) failure mid-stream - partial
+   file's length == written counter == received counter, ≤ 2 000, and the
+   error states the durable byte count. Both are bounded and
+   finalization-free.
+4. **Two test-side mistakes (mine, not the engine's):** the
+   destination-policy test seeded `fixture (1).txt` while asserting on the
+   extension-less `fixture (1)` (the collision file must exist for the
+   numbering to continue - fixed by seeding exactly what is asserted), and
+   the hidden-source test never created the occupied file it relied on
+   (`create_dir_all` on a *non-existent* path happily created a directory
+   - fixed by seeding the file first).
+5. **`char::encode_utf16()` takes a destination buffer** (unlike
+   `str::encode_utf16()`, which is count-only): the per-character unit
+   size in `cap_units` is `char::len_utf16()`. Caught by `cargo check`
+   before any run, then reshaped by clippy (`to_digit(..).is_some()` →
+   `is_ascii_hexdigit()`) with zero behavioral change.
+
+### Verification - actual results (all run on Windows)
+
+Working tree, in the ADR-0008 order:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (after `cargo fmt` applied rustfmt's own reflows; re-run clean) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (two lint fixes along the way, see defect #5) |
+| `cargo test` | **158 passed, 0 failed** = 108 unit (74 Phase 3 baseline + sequential 25 + storage/file_writer 6 + progress 1 + http 2) + 11 cli + 15 fixtures + 24 mock_server |
+
+Observed totals (per-module, `--list`): app 3, cli-in-binary 9,
+common::fixture 6, config 7, download::http 4, download::probe 37,
+download::progress 1, download::sequential 25, error 5, logging 5,
+storage::file_writer 6 - together with the three integration targets
+(11 cli, 15 fixtures, 24 mock_server).
+
+- The CLI behavior contract is untouched and still locked by its Phase 1
+  tests (commands print the not-implemented line, exit 1, empty stdout;
+  parse/config rejects are exit 2; logging goes to stderr only).
+- The ADR-0014 double-count disclosure still applies: the six common
+  fixture inline tests run in multiple targets, so 158 double-counts them.
+- Windows honesty: every check in the table ran on Windows (MSVC,
+  rustc 1.99.1); nothing was verified on another platform, and nothing is
+  presented as Windows proof that wasn't.
+- Disclosed limitations carried/honest for this phase: HTTPS handshake is
+  still not exercised by a local test (unchanged Phase 3 limitation); a
+  clean-EOF-vs-`Content-Length` mismatch is not reproducible end-to-end
+  against hyper (it aborts such bodies) - the length-decision logic is
+  covered by the pure `expected_size_of` tests and the probe/GET
+  contradiction shapes; kill-mid-write recovery (crash between file write
+  and DB commit) belongs to the persistence phase, not Phase 4 (no
+  storage engine state on disk exists beyond the partial file by design).
+- `dead_code` waivers: file-level in `src/download/http.rs`,
+  `src/download/probe.rs`, `src/download/sequential.rs`,
+  `src/download/progress.rs`, and `src/storage/file_writer.rs`, each
+  citing the phase that wires them (Phase 11); nothing else was suppressed.
+
+### Scope-control notes
+
+- No SQLite, no archive work, no concurrent/segmented transfers, no
+  auto-resume policy, no GUI, no telemetry - all later phases per
+  `DOCS/phases.md`.
+- The engine is *not* wired to commands: a caller-less public surface
+  stays exactly as honest as the not-implemented dispatch, and the wiring
+  remains Phase 11's deliverable.
+- `expected_size_of` treats a probe record as trustworthy input because
+  the Phase 3 prober only records response-backed facts; it does not
+  re-validate probe honesty (that is the prober's tested contract).
+- Timeout defaults remain provisional numbers (only the 15 s connect
+  timeout is architecture-fixed); changing them is a `HttpTimeouts`
+  default + one locked test, not an API change.
+
+
 
 
 

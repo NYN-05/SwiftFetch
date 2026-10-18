@@ -70,7 +70,7 @@ pub struct ProbeResult {
 
 /// The states a `Content-Length` value can be in after strict parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContentLength {
+pub(crate) enum ContentLength {
     Missing,
     Valid(u64),
     /// Unparseable, conflicting duplicates, or integral overflow: never trusted.
@@ -88,7 +88,7 @@ struct RangeSpec {
 
 /// Content-transform state of a response body.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ContentEncoding {
+pub(crate) enum ContentEncoding {
     /// No `Content-Encoding` header, or explicitly `identity`.
     Identity,
     /// Any other value: a content transform invalidates byte offsets.
@@ -97,11 +97,11 @@ enum ContentEncoding {
 
 /// The metadata carried by any one response of the probe exchange.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ResponseMeta {
-    cl: ContentLength,
-    etag: Option<String>,
-    last_modified: Option<String>,
-    encoding: ContentEncoding,
+pub(crate) struct ResponseMeta {
+    pub(crate) cl: ContentLength,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) encoding: ContentEncoding,
 }
 
 /// One ranged response as understood by the probe.
@@ -208,7 +208,10 @@ fn parse_unsatisfiable_total(raw: &str) -> Option<u64> {
 }
 
 /// Aggregates the facts of one response (status-agnostic).
-fn response_meta(response: &reqwest::Response) -> ResponseMeta {
+///
+/// pub(crate) so the transfer phase reuses the exact same header-parsing
+/// policy for its own response (one parsing source, one trust policy).
+pub(crate) fn response_meta(response: &reqwest::Response) -> ResponseMeta {
     let cl = content_length_of(response.headers());
     let encoding = match response
         .headers()
@@ -553,7 +556,8 @@ mod tests {
     fn quick_client(ms: u64) -> HttpClient {
         HttpClient::new(HttpTimeouts {
             connect: Duration::from_secs(5),
-            overall: Duration::from_millis(ms),
+            metadata: Duration::from_millis(ms),
+            body_idle: Duration::from_secs(30),
         })
         .expect("custom timeouts build a client")
     }
