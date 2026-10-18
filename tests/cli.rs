@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 
 /// Runs the compiled executable with arguments; returns the output.
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_download-manager"))
+    Command::new(env!("CARGO_BIN_EXE_swift-fetch"))
         .args(args)
         .output()
         .expect("the compiled executable should exist and be runnable")
@@ -68,12 +68,12 @@ fn help_is_accurate_about_what_is_supported() {
 }
 
 #[test]
-fn version_reports_crate_name_and_version() {
+fn version_reports_program_name_and_version() {
     let output = run(&["--version"]);
 
     assert!(output.status.success());
     let text = stdout(&output);
-    assert!(text.contains("download-manager"), "stdout: {text}");
+    assert!(text.contains("SwiftFetch"), "stdout: {text}");
     assert!(
         text.contains(env!("CARGO_PKG_VERSION")),
         "version output must carry the package version: {text}"

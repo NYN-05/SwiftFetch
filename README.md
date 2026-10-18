@@ -1,6 +1,7 @@
-# download-manager
+# SwiftFetch
 
-A lightweight, Windows-first command-line download manager in Rust. It accepts
+SwiftFetch is a lightweight, Windows-first command-line download manager in
+Rust. It accepts
 one URL or a list of URLs, downloads files efficiently and reliably, resumes
 interrupted downloads, and automatically extracts completed ZIP archives.
 
@@ -16,7 +17,7 @@ shared infrastructure are in place; downloading is not implemented yet.
 
 ## CLI (Phase 1 preview)
 
-Try `download-manager --help`. The command surface (`download`, `status`,
+Try `swift-fetch --help`. The command surface (`download`, `status`,
 `resume`, `retry`) and shared configuration, error, and logging foundations
 exist, but no command is wired to a transfer engine yet: every command exits
 with an honest not-implemented error (exit code 1; invalid invocations exit 2).

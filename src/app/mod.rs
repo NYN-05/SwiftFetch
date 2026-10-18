@@ -34,8 +34,8 @@ mod tests {
     #[test]
     fn every_queue_command_reports_not_implemented_in_phase_1() {
         for command in ["status", "resume", "retry"] {
-            let cli = Cli::try_parse_from(["download-manager", command])
-                .expect("valid subcommand must parse");
+            let cli =
+                Cli::try_parse_from(["swift-fetch", command]).expect("valid subcommand must parse");
             let error = run(&cli).expect_err("phase 1 must not claim success for any command");
             assert_eq!(error.category(), ErrorCategory::NotYetImplemented);
             assert!(
@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn download_with_valid_arguments_reports_not_implemented() {
         let cli = Cli::try_parse_from([
-            "download-manager",
+            "swift-fetch",
             "download",
             "https://localhost:9000/fixture.bin",
         ])
@@ -61,14 +61,13 @@ mod tests {
 
     #[test]
     fn download_validation_errors_precede_the_not_implemented_guard() {
-        let cli = Cli::try_parse_from(["download-manager", "download", "ftp://host/f"])
+        let cli = Cli::try_parse_from(["swift-fetch", "download", "ftp://host/f"])
             .expect("arguments must parse");
         let error = run(&cli).expect_err("invalid URL must be rejected early");
         assert_eq!(error.category(), ErrorCategory::Input);
 
-        let cli =
-            Cli::try_parse_from(["download-manager", "download", "-j", "0", "https://host/f"])
-                .expect("arguments must parse");
+        let cli = Cli::try_parse_from(["swift-fetch", "download", "-j", "0", "https://host/f"])
+            .expect("arguments must parse");
         let error = run(&cli).expect_err("non-positive concurrency must be rejected early");
         assert_eq!(error.category(), ErrorCategory::Input);
     }

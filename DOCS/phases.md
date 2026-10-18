@@ -1,4 +1,4 @@
-# Development Phases — Windows-First CLI Download Manager
+# Development Phases — Windows-First CLI Download Manager (SwiftFetch)
 
 ## 1. Purpose and Source of Truth
 

@@ -1,8 +1,8 @@
 [package]
-name = "download-manager"
-version = "0.2.0"
+name = "swift-fetch"
+version = "0.3.0"
 edition = "2021"
-description = "Windows-first command-line download manager"
+description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
 
 # Phase 1 introduces the CLI shell, configuration, errors, and logging.

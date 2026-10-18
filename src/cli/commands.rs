@@ -14,10 +14,10 @@ use std::path::PathBuf;
 /// trailing status line states this explicitly.
 #[derive(Debug, Parser)]
 #[command(
-    name = "download-manager",
+    name = "SwiftFetch",
     version,
-    about = "Windows-first command-line download manager.",
-    long_about = "Windows-first command-line download manager.",
+    about = "SwiftFetch — Windows-first command-line download manager.",
+    long_about = "SwiftFetch — Windows-first command-line download manager.",
     after_help = "Development status: all commands are defined here, but none \
                  are wired to a transfer engine yet; they exit with an honest \
                  not-implemented error."

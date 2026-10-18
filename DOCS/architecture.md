@@ -1,4 +1,4 @@
-# Architecture — Windows-First CLI Download Manager
+# Architecture — Windows-First CLI Download Manager (SwiftFetch)
 
 ## 1. Purpose and Architectural Principles
 
@@ -94,7 +94,7 @@ The application is a **modular monolith**: one executable with explicit module b
 Suggested source layout:
 
 ```text
-download-manager/
+swift-fetch/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── README.md

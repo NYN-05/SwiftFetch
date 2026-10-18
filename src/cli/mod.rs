@@ -219,7 +219,7 @@ mod tests {
         use clap::Parser;
 
         let parsed = Cli::try_parse_from([
-            "download-manager",
+            "swift-fetch",
             "download",
             "--url-file",
             "urls.txt",
@@ -242,13 +242,9 @@ mod tests {
             "documented options must also produce a valid configuration"
         );
 
-        let verbose = Cli::try_parse_from([
-            "download-manager",
-            "download",
-            "-v",
-            "https://example.com/f",
-        ])
-        .expect("--verbose must parse from subcommand level");
+        let verbose =
+            Cli::try_parse_from(["swift-fetch", "download", "-v", "https://example.com/f"])
+                .expect("--verbose must parse from subcommand level");
         assert!(verbose.verbose);
         let outcome = crate::app::run(&verbose).expect_err("phase 1 must not claim success");
         assert!(

@@ -1,4 +1,4 @@
-# Windows-First CLI Download Manager
+# Windows-First CLI Download Manager (SwiftFetch)
 
 ## Core Idea
 
