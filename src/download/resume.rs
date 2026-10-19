@@ -3430,7 +3430,7 @@ mod tests {
         )
         .expect("the matching validator stored");
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "range-hostile.bin", &*fixture.slice(0, 511));
+        stage_partial(&dir, "range-hostile.bin", &fixture.slice(0, 511));
 
         let download = drive(&repo, &server, "/range-hostile.bin", &dir, 5)
             .await
