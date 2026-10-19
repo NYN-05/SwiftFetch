@@ -1678,6 +1678,39 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
     (`clippy.txt`/`test.txt`/`test3.txt`, `baseline_wt.txt` and
     friends); entries record only actually observed results.
 
+### Phase 10 verification addendum (post-commit, appended 2026-10-19)
+
+- **Commits carrying Phase 10:** the code was not landed in one
+  phase-styled commit (disclosed in the entry above): `cde0a21`,
+  `d599fb6`, then two operator-authored, pushed mid-session snapshots
+  `105639d` (the completed engine, wiring, mock knob, lock pruning) and
+  `f1ffb13` (version `0.12.0`, ADR-0022, the three mock knob tests).
+  The entry itself is `- "Phase 10: Safe automatic ZIP
+  extraction (v0.12.0)"` (`b431d83`; `changes.md` only, 162
+  insertions). The hash is recorded here and in `git log`, not inside
+  the entry itself (same honesty rule as the earlier phase entries).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `b431d83` to a fresh temp directory on Windows - MSVC, rustc 1.99.1 -
+  the clone was removed after the run; `git status --porcelain` was
+  empty at entry-commit time; run in order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, exit 0 |
+| `cargo test` (unit target; `cargo test` fail-fasts there) | 253 passed, 7 failed (153.8 s cold) - the same seven Phase 9-lineage failures named in the entry, reproduced in a cold clone |
+| `cargo test --test cli` | 11 passed, 0 failed (2.4 s) |
+| `cargo test --test fixtures` | 15 passed, 0 failed (0.0 s) |
+| `cargo test --test mock_server` | 33 passed, 0 failed (2.1 s) |
+
+- The cold clone reproduces the working tree exactly: every extraction
+  test passes, and the seven pre-existing segmented-recovery failures
+  appear in both runs, so they are inherited defects of the Phase 9
+  lineage, not flakes of a single run and not Phase 10 regressions.
+- This addendum records only its own commit hash and results; the
+  pre-existing Phase 9 failures remain unowned here (the phase-boundary
+  law) pending the owner's explicit decision on a Phase 9 repair.
+
 
 
 
