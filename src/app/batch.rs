@@ -40,9 +40,9 @@
 //!   streams park `paused`, and a later invocation resumes them.
 //!
 //! The returned report is completion-ordered data for the Phase 11 command
-//! layer, which owns summaries, exit codes, and all user-facing redaction.
-
-#![allow(dead_code)] // commands arrive in Phase 11; narrow waiver per AGENTS.md
+//! layer, which owns summaries, progress rendering, exit codes, and all
+//! user-facing redaction. Live per-transfer progress is observable through
+//! the [`TransferRegistry`] produced here and drained by the command layer.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -55,7 +55,7 @@ use tokio::task::JoinSet;
 
 use crate::download::http::HttpClient;
 use crate::download::probe::validate_url;
-use crate::download::progress::Progress;
+use crate::download::progress::{Progress, TransferKey, TransferRegistry};
 use crate::download::resume::{
     transfer_persisted, unresolved_multiplicity_error, ShutdownHandle, RECOVERABLE,
 };
@@ -155,6 +155,8 @@ pub(crate) async fn run_batch(
     max_concurrent_files: u32,
     policy: &RetryPolicy,
     segmentation: &SegmentationPolicy,
+    registry: &Arc<TransferRegistry>,
+    zip_auto_extract: bool,
     shutdown: &ShutdownHandle,
     now: fn() -> u64,
 ) -> Result<BatchReport, AppError> {
@@ -193,8 +195,9 @@ pub(crate) async fn run_batch(
         segmentation: *segmentation,
         shutdown: shutdown.clone(),
         gauge: Arc::clone(&gauge),
+        registry: Arc::clone(registry),
         now,
-        zip_auto_extract: true, // TODO: read from config in Phase 11
+        zip_auto_extract,
     };
     let mut workers = JoinSet::new();
     for _ in 0..worker_count {
@@ -267,6 +270,7 @@ struct WorkerContext {
     segmentation: SegmentationPolicy,
     shutdown: ShutdownHandle,
     gauge: Arc<ActiveGauge>,
+    registry: Arc<TransferRegistry>,
     now: fn() -> u64,
     zip_auto_extract: bool,
 }
@@ -329,12 +333,15 @@ async fn worker(
             DownloadResult::Interrupted
         } else {
             let guard = context.gauge.enter();
+            let key = TransferKey::new(item.url.clone(), context.output_dir.clone());
+            let progress = Progress::shared();
+            context.registry.publish(key.clone(), Arc::clone(&progress));
             let attempt = transfer_persisted(
                 &context.client,
                 &context.repo,
                 &item.url,
                 &context.output_dir,
-                Progress::shared(),
+                progress,
                 &context.policy,
                 &context.segmentation,
                 context.now,
@@ -342,6 +349,7 @@ async fn worker(
                 context.zip_auto_extract,
             )
             .await;
+            context.registry.remove(&key);
             drop(guard);
             match attempt {
                 Ok(download) => DownloadResult::Completed {
@@ -700,6 +708,7 @@ mod tests {
     use super::*;
     use crate::common::fixture::Fixture;
     use crate::common::server::{Behavior, MockServer};
+    use crate::download::progress::TransferRegistry;
     use crate::download::resume::ShutdownSignal;
     use crate::storage::repository::{DownloadRecord, SegmentState};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -763,6 +772,8 @@ mod tests {
             limit,
             &RetryPolicy::from_retries(0),
             &SegmentationPolicy::default(),
+            &TransferRegistry::shared(),
+            true,
             shutdown,
             test_clock,
         )
@@ -1479,6 +1490,8 @@ mod tests {
             2,
             &RetryPolicy::from_retries(0),
             &segmentation,
+            &TransferRegistry::shared(),
+            true,
             &handle,
             test_clock,
         )
@@ -1628,6 +1641,8 @@ mod tests {
                     1,
                     &RetryPolicy::from_retries(0),
                     &SegmentationPolicy::default(),
+                    &TransferRegistry::shared(),
+                    true,
                     &handle,
                     test_clock,
                 )
@@ -1744,6 +1759,8 @@ mod tests {
                     1,
                     &RetryPolicy::from_retries(0),
                     &SegmentationPolicy::default(),
+                    &TransferRegistry::shared(),
+                    true,
                     &handle,
                     test_clock,
                 )

@@ -40,6 +40,12 @@ pub enum ErrorCategory {
     /// Cancellation and shutdown outcomes.
     Cancelled,
     /// Command surface defined in Phase 1 but wired in a later phase.
+    ///
+    /// Since Phase 11 every command is wired, and no production path
+    /// constructs this category anymore; it stays in the taxonomy because
+    /// the category set, its order, and its identifiers are the Phase 1
+    /// contract locked by tests (categories are appended when a phase
+    /// requires them, never removed to rewrite history).
     NotYetImplemented,
 }
 
@@ -123,18 +129,6 @@ impl AppError {
         Self::new(ErrorCategory::Input, message)
     }
 
-    /// Creates the Phase 1 guard error for a defined but unwired command.
-    #[must_use]
-    pub fn not_yet_implemented(command: &'static str) -> Self {
-        Self::new(
-            ErrorCategory::NotYetImplemented,
-            format!(
-                "the {command} command is not implemented yet; it will be \
-                 available when its phase arrives"
-            ),
-        )
-    }
-
     /// Attaches an internal diagnostic source that never appears in the
     /// user-facing `Display` output.
     #[must_use]
@@ -150,7 +144,6 @@ impl AppError {
     }
 
     /// The user-facing message.
-    #[allow(dead_code)] // message kept stable for tests; surfacing grows later
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -222,18 +215,6 @@ mod tests {
                 .contains("simulated internal diagnostic detail"),
             "user-facing display leaked internal context: {}",
             err
-        );
-    }
-
-    #[test]
-    fn not_yet_implemented_names_the_command() {
-        let err = AppError::not_yet_implemented("download");
-        assert_eq!(err.category(), ErrorCategory::NotYetImplemented);
-        assert_eq!(err.category().exit_code(), 1);
-        assert!(
-            err.message().contains("download"),
-            "message must name the command: {}",
-            err.message()
         );
     }
 }

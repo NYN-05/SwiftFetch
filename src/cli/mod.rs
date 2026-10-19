@@ -3,8 +3,12 @@
 //! The CLI layer never implements transfer logic; it maps parsed arguments
 //! onto the shared configuration types, validates obvious input errors
 //! early, and delegates command dispatch to the application entry point.
+//! Since Phase 11 it also owns user-facing rendering: live progress
+//! (`progress`) and the persisted-queue status listing (`status`).
 
 mod commands;
+pub(crate) mod progress;
+pub(crate) mod status;
 
 pub use commands::{Cli, Commands, DownloadArgs};
 use std::path::PathBuf;
@@ -215,7 +219,6 @@ mod tests {
     #[test]
     fn cli_parse_accepts_the_documented_surface() {
         use crate::cli::{Cli, Commands};
-        use crate::error::AppError;
         use clap::Parser;
 
         let parsed = Cli::try_parse_from([
@@ -246,10 +249,8 @@ mod tests {
             Cli::try_parse_from(["swift-fetch", "download", "-v", "https://example.com/f"])
                 .expect("--verbose must parse from subcommand level");
         assert!(verbose.verbose);
-        let outcome = crate::app::run(&verbose).expect_err("phase 1 must not claim success");
-        assert!(
-            matches!(outcome, AppError { .. }),
-            "run returns the typed error"
-        );
+        // Dispatch itself is exercised end to end by tests/cli.rs against
+        // the local mock server (unit tests must never touch the real
+        // application-data directory or the network).
     }
 }

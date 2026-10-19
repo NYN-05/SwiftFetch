@@ -1463,6 +1463,189 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0022 | Phase 10 safe automatic ZIP extraction: finalization-gated trigger, sealed entry names, no-silent-overwrite collisions, bounded claims and writes, and a separately-ledgered extraction lifecycle | Accepted |
 
+## ADR-0023 - Phase 11 command wiring: services-only dispatch, the database-location override, the pre-documented `failed → queued` retry edge, and the exit-code mapping
+
+- **Status:** Accepted
+- **Date:** 2026-10-19
+- **Context:** Phase 11 wires `download`/`status`/`resume`/`retry` to the
+  completed engine and storage layers. The phase's constraints: the CLI
+  must never duplicate transfer or storage logic; exit codes must match
+  the documented table (`0` all requested downloads completed, `1` at
+  least one did not or the command could not run, `2` invalid
+  invocation/configuration); the persisted lifecycle graph may only gain
+  edges through explicit, tested decisions; automated end-to-end tests
+  must never touch the user's real `%LOCALAPPDATA%` database or live
+  network; and stdout stays reserved for results while logs go to stderr
+  with every URL redacted. ADR-0009 had recorded the "not implemented
+  yet" contract errors, explicitly reserving them until the commands'
+  phases arrived; Phase 11 is that phase for all four commands. The
+  batch scheduler, the engine's shutdown path, and resume classes were
+  all in place since Phases 6-8; the command layer only had to
+  orchestrate them - and to do so without spawning unbounded tasks.
+- **Decision:**
+  1. **Dispatch law.** `app::run` maps the parsed CLI contract to four
+     ordinary handlers and nothing more: handlers orchestrate
+     services (the batch scheduler, the resume/retry selection and the
+     persisted engine, repository queries), render results, and map
+     outcomes to
+     `CommandEnd` values; they implement no HTTP, filesystem, or SQLite
+     logic, and they never fabricate success. The process's exit code
+     is computed in `main` from `CommandEnd::exit_code()` or from the
+     error-category table (`Input` → 2, everything else → 1), so the
+     ADR-0009 exit-code contract survives wiring byte-for-byte.
+  2. **Runtime law.** `main` builds an explicit current-thread tokio
+     runtime (`Builder::new_current_thread().enable_all()`, no
+     `#[tokio::main]` bootstrap macro) and drops it via
+     `shutdown_timeout(1s)` before `std::process::exit`. The engine is
+     a bounded pool of tasks over one serialized SQLite connection, not
+     a many-core server; an explicit small runtime keeps the
+     single-threaded SQLite access honest, keeps spawned worker tasks
+     from outliving the process, and makes the tokio `signal` feature
+     (ADR-0003 first-use rule) the only runtime dependency Phase 11
+     adds; `time` was already product since Phase 6.
+  3. **Database-location override.** The repository gains a pure
+     resolver family: `database_path(explicit, local_root)` wins an
+     explicit `SWIFT_FETCH_DATABASE` location (an empty value is not a
+     location and falls through), otherwise derives
+     `<local_root>\SwiftFetch\swiftfetch.sqlite3` from
+     `LOCALAPPDATA`, and refuses - typed, actionable - when neither is
+     available. The env-var name is the ADR-0011 crate form. Purpose:
+     hermetic end-to-end tests (per-`Scratch`-test temp path, no
+     concurrency hazards of environment mutation inside the tests
+     themselves) and deliberate profile separation on one machine; a
+     value that names a nonexistent directory is created by the
+     existing connection logic, and no other precedence case exists.
+  4. **The `failed → queued` edge is now exercised, not added.** The
+     ADR-0018 graph had documented (pre-Phase-11 comment) that `failed`
+     records re-enter the queue *only through the retry command's
+     phase*; Phase 11 needs exactly that edge and nothing else, so
+     `DownloadState::allows` admits `(Failed, Queued)` in addition to
+     the recorded pairs and its doc comment names this phase. The
+     exhaustive transition truth-table test over every
+     `(from, to)` pair locks the change; entering `failed` still
+     requires an error category (unchanged), and the requeue write
+     clears the stored `error_category` while `retry_count` keeps its
+     history. `cancelled` remains fully terminal: the user gave a
+     cancelled record up, and no command - including `retry` - can
+     resurrect it. One `(url, output_dir)` scope still owns exactly one
+     unfinished record (ADR-0020); the requeue write cannot create a
+     duplicate.
+  5. **Selection and queue-worker law.** `resume` selects records whose
+     state is one of ADR-0019's `RECOVERABLE` states and drives each
+     through the persisted engine, with `plan_for` unchanged as the
+     per-record "may we resume safely" verdict; `retry` selects `failed`
+     records, requeues them through decision 4, then drives them the
+     same way. Both commands run their selections on
+     `min(max_concurrent_files, selections)` bounded `QueueWorker`
+     tasks over bounded channels - never one task per URL - and a
+     worker-task join failure is reported as a typed Database-category
+     error ("a queue worker task failed unexpectedly (this is a
+     bug)") rather than avoided silence. An empty selection prints
+     `SwiftFetch: nothing to {label}; no eligible downloads on
+     record.` and exits `0` (nothing needed doing is not failure).
+     A selection whose destination parent is empty (e.g. a record
+     whose destination has no parent directory) is reported as that
+     record's Input failure before anything is networked: `Path::parent`
+     returning `Some("")` for a bare file name is treated honestly, not
+     as a parseable directory.
+  6. **Progress display law.** Live progress is read from the
+     scheduler-produced `TransferRegistry` (`TransferKey` = normalized
+     URL × output dir; registry publication/removal distributed over
+     the engine's wait-free byte counters `Progress` publishes from
+     workers, with snapshot() cloning `Arc<Progress>` handles so UI
+     work is never holding the engine's locks and the snapshot can
+     never see a removed entry as live). The renderer draws one
+     progress line per live transfer whose bytes changed since the
+     previous sweep, at a fixed refresh interval (250 ms; bounded
+     redraw, not event storming); speed comes from a two-second
+     rolling window over observed bytes (the byte delta between the
+     oldest and newest retained samples divided by their real elapsed
+     time; fewer than two samples or a zero elapsed time is an honest
+     "speed not yet measured", never a guess), and unknown expected
+     sizes render as "size unknown" with no fabricated percentage or
+     ETA.
+  7. **Cross-test honesty (contract updates only).** The Phase 1
+     "not implemented yet" guard is retired *because its reserved phase
+     arrived* (ADR-0009's text documented exactly this retirement path);
+     the `NotYetImplemented` category stays in the taxonomy (its
+     components are recorded but unreachable), the retired tests are
+     replaced by tests locking the new dispatch behavior, and the
+     terminal-hop test around decision 4 is updated to the documented
+     graph. A failing test only changes when the contract it locked
+     changes deliberately and is documented in the phase entry (see
+     `changes.md` Phase 11, disclosures).
+- **Alternatives considered (and rejected):**
+  1. **`#[tokio::main]` runtime bootstrap** - rejected: the macro's
+     default multi-threaded runtime and the ownership of the runtime
+     the shutdown path needs (`shutdown_timeout`) are hidden behind
+     attribute magic, and the project's SQLite is mutex-serialized
+     per connection; an explicit small runtime documents the
+     concurrency model in code rather than in a comment.
+  2. **Spawn a tokio task per URL in `resume`/`retry`** - rejected:
+     unbounded concurrency violates the project law; the bounded
+     `QueueWorker` pool pattern matches how `run_batch` already
+     schedules concurrent files (ADR-0020).
+  3. **A new `retrying`→`queued` path for `retry`** - rejected: the
+     requeue starts from `failed` (the only state eligible for
+     retrying once a command gets involved) and one edge
+     `failed → queued` explains the whole behavior; arc into
+     `retrying` and we would have needed both `failed → retrying` and
+     a new `retrying → queued` pair whose meaning nobody has yet
+     pinned down. `Retrying` stays a mid-download transient reached
+     mid-download (from `downloading`), and the user-facing retry
+     command stays a pure requeue + re-drive.
+  4. **Keep `update_status` from clearing error_category on healthy
+     states** - rejected: stale reasons on records that returned to
+     health are exactly the "column's meaning sharp" invariant the
+     Phase 5 design text pinned; leaving a `[failed] reason: http`
+     residue next to a currently-running download would be a lie.
+  5. **Fail `resume`/`retry` with exit 1 when the selection is empty** -
+     rejected: nothing the user asked to be done remains to be done;
+     the honest outcome of "no eligible record" is success with an
+     explanation (exit 0), while records that were selected but then
+     failed still ride the partial-failure exit code.
+  6. **Read the database path into a CLI flag** - rejected: the
+     override exists for automated tests and deliberate profile
+     separation; a user-facing flag would silently grow the Phase 1
+     command surface beyond the commands and options the spec defines,
+     and turn a discarded test-isolation knob into a configuration
+     liability.
+- **Consequences:**
+  - All four commands are live and the suite exercises them end to
+    end against the local mock server with `SWIFT_FETCH_DATABASE`
+    pointing at per-test paths; every command's exit code is exactly
+    the documented table's.
+  - `Ctrl+C` now trips the engine's shutdown handle at the command
+    layer: in-flight transfers park `paused` through the Phase 6
+    durable path, the same mechanism every engine test already
+    relies on, and the command exits with the honest interrupted
+    report (exit 1), leaving the persisted state able to resume.
+  - The command layer is measurement-first: progress and status
+    come from the shared registry and stored rows, so display never
+    invents state, and the engine's byte counters stay wait-free.
+  - `NotYetImplemented` is dead-but-contracted: reachable in the type
+    system for Phase 1 test compatibility, but no production path can
+    build it. Any future command (post-Phase 11) must reuse an
+    existing category instead of re-growing this one.
+  - Pre-existing Phase 9-lineage segmented-recovery failures are
+    reproduced, not repaired (phase-boundary law); they are listed in
+    the Phase 11 `changes.md` entry and remain pending the owner's
+    explicit decision on a Phase 9 repair.
+- **Related:** ADR-0003 (tokio `signal` first-use), ADR-0009 (CLI
+  contract this wiring retires the not-implemented guard of while
+  keeping the exit-code table), ADR-0011 (the `SWIFT_FETCH_DATABASE`
+  env-var naming rule), ADR-0018 (the lifecycle graph whose
+  pre-documented retry edge this phase exercises), ADR-0019
+  (`RECOVERABLE` resume classes and `plan_for`), ADR-0020 (batch
+  scheduling the bounded worker pool mirrors),
+  `DOCS/phases.md` Phase 11, `changes.md` Phase 11 entry.
+
+### Addendum-index extension (ADR-0023 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0023 | Phase 11 command wiring: services-only dispatch, the database-location override, the pre-documented `failed → queued` retry edge, and the exit-code mapping | Accepted |
+
 
 
 

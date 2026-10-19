@@ -107,7 +107,11 @@ impl DownloadState {
     ///   `completed` — extraction success/failure is recorded in the
     ///   `extractions` table, never in the download's own state, because a
     ///   successfully downloaded file stays successfully downloaded;
-    /// - `failed` and `cancelled` are terminal for now.
+    /// - `failed` re-enters the queue only through the Phase 11 `retry`
+    ///   command (`failed → queued`, the explicit, tested requeue edge the
+    ///   graph reserved for that phase; `retry_count` is kept as history);
+    /// - `cancelled` remains terminal — the user gave it up, and no command
+    ///   resurrects a cancelled record.
     ///
     /// Not permitted: skipping states, re-entering an earlier state from a
     /// later one (except the `completed` ⇄ `extracting` round trip), closing
@@ -135,6 +139,7 @@ impl DownloadState {
                 | (DownloadState::Retrying, DownloadState::Cancelled)
                 | (DownloadState::Finalizing, DownloadState::Completed)
                 | (DownloadState::Finalizing, DownloadState::Failed)
+                | (DownloadState::Failed, DownloadState::Queued)
                 | (DownloadState::Completed, DownloadState::Extracting)
                 | (DownloadState::Extracting, DownloadState::Completed)
         )
@@ -384,12 +389,32 @@ pub(crate) fn database_path_in(local_root: Option<&OsStr>) -> Result<PathBuf, Ap
     Ok(Path::new(root).join("SwiftFetch").join(DATABASE_FILE_NAME))
 }
 
+/// Resolves the database path when an explicit location is requested
+/// (`SWIFT_FETCH_DATABASE`, the ADR-0011 env-var form of the crate name).
+///
+/// A deliberate explicit location wins over the platform default: this is
+/// how automated end-to-end tests keep the persistence layer hermetic and
+/// how a second profile on one machine can be separated deliberately. An
+/// empty value is not a location and falls through to the platform
+/// resolution (which still refuses to guess). Kept pure so tests exercise
+/// the precedence without racing process environment variables.
+pub(crate) fn database_path(
+    explicit: Option<&OsStr>,
+    local_root: Option<&OsStr>,
+) -> Result<PathBuf, AppError> {
+    if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(explicit));
+    }
+    database_path_in(local_root)
+}
+
 /// Resolves the database path from the platform's local application-data
 /// directory (`%LOCALAPPDATA%` on Windows, the platform SwiftFetch treats
-/// as first-class).
+/// as first-class), honoring an explicit `SWIFT_FETCH_DATABASE` override.
 pub(crate) fn default_database_path() -> Result<PathBuf, AppError> {
+    let explicit = std::env::var_os("SWIFT_FETCH_DATABASE");
     let local = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty());
-    database_path_in(local.as_deref())
+    database_path(explicit.as_deref(), local.as_deref())
 }
 
 /// The metadata repository: one connection to one SQLite file, serialized
@@ -1442,7 +1467,9 @@ mod tests {
             ),
             (DownloadState::Completed, &[DownloadState::Extracting]),
             (DownloadState::Extracting, &[DownloadState::Completed]),
-            (DownloadState::Failed, &[]),
+            // Phase 11: the retry command's requeue edge, added by explicit
+            // tested decision (ADR-0023). `cancelled` stays terminal.
+            (DownloadState::Failed, &[DownloadState::Queued]),
             (DownloadState::Cancelled, &[]),
         ];
         for (from, allowed) in truth {
@@ -1550,20 +1577,52 @@ mod tests {
         )
         .expect("failed");
 
-        for to in [DownloadState::Queued, DownloadState::Downloading] {
+        // As of Phase 11 a failed record is no longer fully terminal: the
+        // `retry` command requeues it through the explicit `failed → queued`
+        // edge the graph reserved for that phase (ADR-0023). Every other hop
+        // out of `failed` is still rejected at the database level — the same
+        // checks the exhaustive truth table locks above.
+        for to in [
+            DownloadState::Downloading,
+            DownloadState::Probing,
+            DownloadState::Finalizing,
+            DownloadState::Cancelled,
+        ] {
             let err = repo
                 .update_status(failed, to, 1_700_000_003, None)
-                .expect_err("failed is terminal");
+                .expect_err("failed only re-enters the queue");
             assert!(err.message().contains("cannot move from"), "{err}");
         }
 
+        repo.update_status(failed, DownloadState::Queued, 1_700_000_004, None)
+            .expect("the retry requeue edge is permitted");
+        let record = repo.get_download(failed).expect("read").expect("present");
+        assert_eq!(record.status, DownloadState::Queued, "requeued for retry");
+        assert_eq!(
+            record.error_category, None,
+            "the requeue clears the stored reason"
+        );
+        assert_eq!(
+            record.retry_count, 0,
+            "update_status keeps retry history untouched \
+             (`set_retry_count` owns it)"
+        );
+
+        // `cancelled` remains fully terminal: the user gave the record up,
+        // and no command — including `retry` — resurrects it (ADR-0023).
         let cancelled = insert(&repo, "https://db.test/terminal-2", "terminal-2");
-        repo.update_status(cancelled, DownloadState::Cancelled, 1_700_000_004, None)
+        repo.update_status(cancelled, DownloadState::Cancelled, 1_700_000_005, None)
             .expect("cancel queued work");
-        let err = repo
-            .update_status(cancelled, DownloadState::Probing, 1_700_000_005, None)
-            .expect_err("cancelled is terminal");
-        assert!(err.message().contains("cannot move from"), "{err}");
+        for to in [
+            DownloadState::Probing,
+            DownloadState::Failed,
+            DownloadState::Queued,
+        ] {
+            let err = repo
+                .update_status(cancelled, to, 1_700_000_006, None)
+                .expect_err("cancelled is terminal");
+            assert!(err.message().contains("cannot move from"), "{err}");
+        }
     }
 
     #[test]
@@ -2014,6 +2073,39 @@ mod tests {
             default.parent().and_then(Path::file_name),
             Some(OsStr::new("SwiftFetch"))
         );
+    }
+
+    #[test]
+    fn an_explicit_database_location_overrides_the_platform_default() {
+        // The Phase 11 command wiring resolves this precedence on every
+        // launch; hermetic end-to-end tests depend on it. Pure form: the
+        // precedence is derived, never read from the process environment
+        // here, so parallel tests cannot race it.
+        let explicit = OsStr::new(r"D:\profiles\swiftfetch\queue.sqlite3");
+        let resolved = super::database_path(
+            Some(explicit),
+            Some(OsStr::new(r"C:\Users\demo\AppData\Local")),
+        )
+        .expect("explicit location wins");
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"D:\profiles\swiftfetch\queue.sqlite3"),
+            "an explicit location replaces the platform default"
+        );
+
+        // An empty explicit value is not a location; the platform default
+        // still applies (and still refuses a missing root).
+        let resolved =
+            super::database_path(Some(OsStr::new("")), Some(OsStr::new(r"C:\AppDataRoot")))
+                .expect("an empty override falls back to the platform location");
+        assert_eq!(
+            resolved,
+            PathBuf::from(r"C:\AppDataRoot\SwiftFetch\swiftfetch.sqlite3"),
+            "the empty override is not a location"
+        );
+        let err = super::database_path(Some(OsStr::new("")), None)
+            .expect_err("empty override is not a fallback guess");
+        assert_eq!(err.category(), ErrorCategory::Filesystem);
     }
 
     #[test]

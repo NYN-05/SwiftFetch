@@ -1,10 +1,19 @@
 //! Windows-first CLI download manager.
 //!
 //! The binary is a thin layer: it parses the CLI contract, installs
-//! diagnostics, and dispatches to the application entry point, mapping
-//! typed errors to documented exit codes. All transfer, storage, and
-//! archive behavior lives in modules introduced by later phases
+//! diagnostics, builds the async runtime the command workflows run on
+//! (explicitly, current-thread — no bootstrap macro), and maps the typed
+//! outcomes to the documented exit codes. All transfer, storage, and
+//! archive behavior lives in the engine and storage modules
 //! (`DOCS/phases.md`).
+//!
+//! Exit codes (help text and README carry the same table):
+//! - `0` — every requested download of the invocation completed;
+//! - `1` — at least one did not (failed or interrupted), or the command
+//!   could not continue (unrecoverable application failure);
+//! - `2` — invalid invocation or configuration.
+
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -28,12 +37,25 @@ pub(crate) mod common;
 fn main() {
     let cli = cli::Cli::parse();
     logging::init(cli.verbose);
-    let exit_code = match app::run(&cli) {
-        Ok(()) => 0,
+
+    // The workflows are async (the engine's shutdown and progress wiring
+    // races on tokio primitives); the runtime itself is deliberately
+    // current-thread: the engine is a bounded pool of tasks over one
+    // serialized database connection, not a many-core server.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the tokio runtime must build");
+
+    let exit_code = match runtime.block_on(app::run(&cli)) {
+        Ok(end) => end.exit_code(),
         Err(err) => {
             eprintln!("error: {err}");
             err.category().exit_code()
         }
     };
+    // Drop the runtime first so spawned tasks are joined/torn down before
+    // the process ends; then exit with the documented code.
+    runtime.shutdown_timeout(Duration::from_secs(1));
     std::process::exit(exit_code);
 }

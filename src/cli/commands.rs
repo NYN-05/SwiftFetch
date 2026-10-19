@@ -1,26 +1,27 @@
 //! Clap-based command definitions.
 //!
-//! This is the typed CLI contract. Every command listed here is *defined* in
-//! Phase 1; only later phases wire them to implementations. Help text must
-//! therefore stay accurate about what is actually supported: unwired
-//! commands say so.
+//! This is the typed CLI contract. Since Phase 11 every command is wired
+//! to its implementation (download through the engine, the queue commands
+//! through the persisted state); help text documents what the commands do
+//! and the exit-code table they honor.
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Root of the command-line interface.
 ///
-/// The help text must not promise behavior that does not exist yet; the
-/// trailing status line states this explicitly.
+/// The trailing status text carries the documented exit-code table: the
+/// same table `main` maps outcomes through and the README documents.
 #[derive(Debug, Parser)]
 #[command(
     name = "SwiftFetch",
     version,
     about = "SwiftFetch — Windows-first command-line download manager.",
     long_about = "SwiftFetch — Windows-first command-line download manager.",
-    after_help = "Development status: all commands are defined here, but none \
-                 are wired to a transfer engine yet; they exit with an honest \
-                 not-implemented error."
+    after_help = "Exit codes: 0 every requested download completed; \
+                  1 at least one did not (failed or interrupted), or the \
+                  command could not run; 2 invalid invocation or \
+                  configuration."
 )]
 pub struct Cli {
     /// The parsed command.
@@ -40,25 +41,25 @@ pub struct Cli {
 /// The exact command surface required by the project.
 ///
 /// `download` carries the download inputs and configuration options;
-/// `status`, `resume`, and `retry` inspect or alter persistent queue state
-/// once persistence exists (Phase 5+).
+/// `status`, `resume`, and `retry` inspect or alter the persistent queue
+/// state.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Download one URL, several URLs, or URLs from a list file (not wired yet).
+    /// Download one URL, several URLs, or URLs from a list file.
     Download(DownloadArgs),
-    /// Inspect queued, active, completed, and failed downloads (not wired yet).
+    /// Inspect queued, active, paused, completed, and failed downloads.
     Status,
-    /// Resume unfinished downloads (not wired yet).
+    /// Resume unfinished downloads from persistent state.
     Resume,
-    /// Retry failed downloads (not wired yet).
+    /// Retry failed downloads from persistent state.
     Retry,
 }
 
 /// Inputs and options of the `download` command.
 ///
-/// The architecture requires Honesty: options printed here must map to real
-/// configuration the engine will consume; the engine arrives in later
-/// phases, until then `download` dispatches an honest not-implemented error.
+/// The architecture requires honesty: options printed here map to real
+/// configuration the engine consumes ([`crate::config::AppConfig`]; the
+/// defaults live there as the single source of truth).
 #[derive(Debug, Default, Args)]
 pub struct DownloadArgs {
     /// One or more HTTP/HTTPS URLs.
@@ -73,8 +74,8 @@ pub struct DownloadArgs {
         short = 'f',
         long = "url-file",
         value_name = "PATH",
-        help = "Plain-text file with one URL per line (content handling \
-                arrives with the transfer engine)"
+        help = "Plain-text file with one URL per line (blank lines and \
+                #-comments are ignored)"
     )]
     pub url_file: Option<PathBuf>,
 
@@ -118,7 +119,7 @@ pub struct DownloadArgs {
     #[arg(
         long = "no-extract",
         help = "Disable automatic ZIP extraction (extraction is enabled by \
-                default; it arrives in a later phase)"
+                default; the downloaded archive is always preserved)"
     )]
     pub no_extract: bool,
 }

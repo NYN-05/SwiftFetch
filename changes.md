@@ -1711,6 +1711,204 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
   pre-existing Phase 9 failures remain unowned here (the phase-boundary
   law) pending the owner's explicit decision on a Phase 9 repair.
 
+## Phase 11 - User-Facing CLI Workflows and Progress
+
+- **Date:** 2026-10-19
+- **Version:** `0.12.0` → `0.13.0`
+- **Outcome:** Phase 11 exit gate met — the Phase 1 contract's reserved
+  phase has arrived, and every defined command is wired to the completed
+  engine and storage services without duplicating transfer or storage
+  logic at the command surface. `download` maps CLI arguments onto `AppConfig`,
+  drives
+  the Phase 7 batch scheduler under the Phase 6 graceful-shutdown path
+  (Ctrl+C trips the engine shutdown; in-flight streams park `paused`),
+  renders live per-transfer progress from the scheduler's own transfer
+  registry, and reports the honest completion summary; `status`, `resume`,
+  and `retry` operate on the persisted queue through a bounded worker pool,
+  with `resume` selecting only ADR-0019's `RECOVERABLE` states and `retry`
+  requeuing only `failed` records through the explicitly tested
+  `failed → queued` edge the ADR-0018 graph had documented for exactly this
+  phase (ADR-0023). Exit codes stay the documented table: `0` every
+  requested download completed, `1` at least one did not (or the command
+  could not run), `2` invalid invocation/configuration.
+- **Files changed (one phase commit `Phase 11: ... (v0.13.0)`):**
+  - `src/app/commands_handler.rs` (+1,060/−28) - the command handlers:
+    `handle_download` (early validation, plumbing resolved through the
+    `SWIFT_FETCH_DATABASE`-aware `default_database_path`, `run_batch` with
+    a registered
+    `ctrl_c` shutdown task, live `render_transfers` sweeps drained from the
+    `TransferRegistry` at a fixed refresh interval, and the final
+    per-attempt report), `handle_status` (read-only persisted-queue
+    rendering), `handle_resume`/`handle_retry` over a shared
+    `handle_queue_work` that drives each selection through the persisted
+    engine with `min(max_concurrent_files, selections)` bounded workers
+    (`QueueWorker` pool over bounded channels — never one task per URL), a
+    reported worker-task join failure mapped to a typed Database-category
+    error ("this is a bug"), and the empty-selection sentence
+    `SwiftFetch: nothing to {label}; no eligible downloads on record.`
+    exiting `0`. Selection is services-first: `plan_for` keeps deciding
+    whether resume is safe; an empty destination parent (clipping a
+    `Path::parent` like `root.bin` to `""`) is that record's Input failure,
+    never networked. 8 inline unit tests.
+  - `src/app/mod.rs` - dispatch becomes `async fn run(...) ->
+    Result<CommandEnd, AppError>`; the Phase 1 not-implemented guard tests
+    are replaced by input-rejection-category tests (disclosed below).
+  - `src/cli/progress.rs` (new) - user-facing measurement rendering:
+    byte sizes in human-readable units, a two-second rolling throughput
+    window (`ThroughputWindow`) whose speed is the byte delta between the
+    oldest and newest retained samples divided by their real elapsed wall
+    time - observed bytes only, an honest `None` (rendered as "speed not
+    yet measured") before two samples or a zero elapsed time, never a
+    config-inferred value - and honest unknown handling (unknown expected
+    size → no percentage, no fabricated ETA; `format_eta` may honestly
+    render `0 s`). 8 inline tests.
+  - `src/cli/status.rs` (new) - `StatusRow` + the `status` list renderer:
+    one line per record in insertion order with the record id, the life
+    cycle state padded to its column, the recorded file name, byte progress
+    only from stored state, each failed record's stored category as its
+    reason, a completed download's failed-extraction annotation, and
+    redacted URLs (display only; stdout has no raw query/fragment). 8
+    inline tests.
+  - `src/download/progress.rs` - the live-transfer registry: `TransferKey`
+    (normalized URL × output directory) and a `TransferRegistry` the batch
+    workers publish/remove per attempt, so a snapshot describes exactly the
+    transfers whose bytes are arriving; the file-level `dead_code` waiver
+    narrows to `written`/`largest_single_write` once the CLI consumes the
+    rest. 3 inline tests.
+  - `src/app/batch.rs` - scheduler signature gains
+    `registry: &Arc<TransferRegistry>` and `zip_auto_extract: bool`
+    (mapping the `--no-extract` configuration; the Phase 10 entry's
+    recorded TODO is consumed here); workers publish/remove the per-attempt
+    keys around each `transfer_persisted` call; the module-level waiver
+    comes off (the command layer now consumes the batch report). 3 direct
+    call sites in tests updated to the extended signature.
+  - `src/main.rs` - the runtime is built explicitly (current-thread,
+    `enable_all`), `run`'s outcome is mapped to `CommandEnd::exit_code()`
+    or the error category's exit code before a 1 s `shutdown_timeout`
+    teardown; documented exit-code table in the module header.
+  - `src/cli/commands.rs` - all help text describes wired behavior; the
+    root `after_help` is the exit-code table `main` and README both use;
+    `--url-file`/`--no-extract` help strings lose their "arrives later"
+    phrasing.
+  - `src/cli/mod.rs` - registers `progress` and `status` submodules; the
+    Phase 1-era not-implemented assertion inside
+    `cli_parse_accepts_the_documented_surface` is retired to a comment -
+    dispatch is exercised end to end by the integration suite instead
+    (disclosed below).
+  - `src/error.rs` - `AppError::not_yet_implemented()` and its unit test
+    are removed (the phase they guarded arrived); the `NotYetImplemented`
+    category/variant stays in the taxonomy because the Phase 1 contract
+    locked the category set's shape; the stale `#[allow(dead_code)]` on
+    `AppError::message()` comes off (production callers now exist).
+  - `src/storage/repository.rs` - pure `database_path(explicit,
+    local_root)`/`database_path_in(...)` plus `default_database_path()`
+    reading `SWIFT_FETCH_DATABASE` (an empty value falls back to the
+    platform default, which still refuses to guess) so automated end-to-end
+    tests are hermetic and a second profile can be separated deliberately;
+    `DownloadState::allows` admits `(Failed, Queued)` (no other hop) with
+    the doc comment updated to state the Phase 11 retry edge; the
+    `update_status` write clears a stored `error_category` when moving to a
+    healthy state, and the exhaustive transition truth-table test and the
+    terminal-hop test are updated to the documented graph (disclosed
+    below).
+  - `tests/cli.rs` (+669/−90) - 24 end-to-end tests over the real binary
+    (`CARGO_BIN_EXE_swift-fetch` + `SWIFT_FETCH_DATABASE` isolation to a
+    per-test temp path): the full download surface (one URL, several URLs,
+    and a `--url-file` list) with the batch clients downloading real bytes
+    from the local mock server, selective execution of only the URLs that
+    still need it, graceful Ctrl+C shutdown parking records durable and
+    resumable, resume semantics (only eligible records; completed stay
+    completed), retry semantics (only failed records; unrelated
+    completed/queued/missing records untouched), status output across all
+    documented lifecycle states, exit codes for success/partial
+    failure/invalid invocation, bounded progress reporting, line-oriented
+    stdout/stderr separation, and the ZIP auto-extraction path flagged
+    through configuration.
+  - `README.md` - status and CLI docs now describe wired commands and the
+    same exit-code table; removal of not-implemented phrasing.
+  - `Cargo.toml`/`Cargo.lock` - version `0.13.0`; tokio gains `signal`
+    (first-use rule, ADR-0003) because the command layer needs a
+    shutdown trip on Ctrl+C that the runtime must wake on.
+- **Disclosures:**
+  - *Phase 1 contract update (the reserved phase arrived).* ADR-0009
+    recorded that unwired commands print "not implemented yet" and exit 1;
+    Phase 11 is the phase those errors reserved, so the guard text is
+    replaced by real behavior rather than silently removed. Nothing invents
+    success at the boundary: invalid input keeps its early rejection and
+    the category taxonomy (including `NotYetImplemented`) survives
+    untouched so the phase-locked tests still hold; see ADR-0023 (decision
+    1) for the reasoning.
+  - *Lifecycle terminal-hop test updated to the documented graph.*
+    `failed_and_cancelled_download_records_are_terminal` previously
+    asserted `failed → queued` was rejected; the ADR-0018 graph had
+    documented (pre-Phase-11) that `failed` re-enters the queue *only
+    through the retry command's phase*, so permitting that exact edge is a
+    deliberate contract update (ADR-0023 decision 4), not a weakening. The
+    updated test asserts the new edge happens and that the
+    remaining forbidden hops (`failed → Downloading/Probing/
+    Finalizing/Cancelled` and `cancelled → Probing/Failed/Queued`) are
+    still rejected atomically. The exhaustive truth-table test over every
+    state pair is locked by ADR-0018+ADR-0023 together.
+  - *Pre-existing failures reproduced, not repaired.* The unit target
+    reports 7 failures - exactly the seven segmented-recovery tests
+    recorded in the Phase 10 entry/addendum as inherited Phase 9 defects of
+    the `722b70f`/`abe2648` lineage:
+    `segmented_recovery_failed_segment_retried`,
+    `segmented_recovery_handles_oversized_partial`,
+    `segmented_recovery_handles_truncated_partial`,
+    `segmented_recovery_handles_unknown_size`,
+    `segmented_recovery_shutdown_parks_paused`,
+    `segmented_recovery_skips_verified_completed_segments`,
+    `a_truncated_segment_is_retried_within_the_budget_and_never_finalized_early`.
+    Phase 11 deliberately does not touch the engine's
+    recovery path or its tests while the owner hasn't sanctioned a Phase 9
+    repair. (These failed identically in the full `cargo test --no-fail-
+    fast` run below; every other test in every target passes.)
+  - *Test-vs-implementation honesty fixes (new code, same phase).*
+    Phase 11's own unit tests inspect, not protect: `format_eta` renders
+    its honest `0 s` instead of clamping a first tick, and the rolling
+    throughput window semantics the tests keep (boundary-inclusive) are
+    what the implementation intends (a tick's first interval still shows
+    progress so early frames are not hidden); no code defection.
+  - *Windows-only e2e harness gotcha (documented for future phases).*
+    `tests/cli.rs` spawns children from a dedicated std thread whose
+    completion mates a tokio oneshot (`run_in`/`run_command`): a blocking
+    `Command::output()` on the test's current-thread runtime starved the
+    mock server's tasks for so long the metadata step timed out. The
+    thread+oneshot pattern is load-bearing; do not replace it with a
+    blocking spawn.
+- **Verification - actual results (all run on Windows):**
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass after one `cargo fmt` formatting application (session drift in `tests/cli.rs` only; formatting change, no semantic diff) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, exit 0 |
+| plain `cargo build` (feature-unification check; tokio `signal` touched) | pass, exit 0 |
+| `cargo test --no-fail-fast` (unit target) | 276 passed, 7 failed (161.4 s) - the same seven inherited ones named above and exactly those |
+| `cargo test --no-fail-fast` (`tests/cli.rs`) | 24 passed, 0 failed (5.4 s) |
+| `cargo test --no-fail-fast` (`tests/fixtures.rs`) | 15 passed, 0 failed (0.01 s) |
+| `cargo test --no-fail-fast` (`tests/mock_server.rs`) | 33 passed, 0 failed (2.1 s) |
+
+  - Note `--no-fail-fast`: plain `cargo test` stops after the failing unit
+    target, so the integration targets would never be reached; the
+    non-fail-fast invocation is how Phase 11 asserts "all CLI end-to-end
+    tests pass" alongside the inherited engine failures.
+- **Scope-control notes:**
+  - The CLI never implements HTTP or filesystem logic: progress, states,
+    and timings come from the engine's registry/persisted rows; teardown,
+    permissions, download scheduling, and segment planning stay in
+    `batch.rs`/`resume.rs`/`file_writer.rs` as before.
+  - The status list line length and column alignment are presentation
+    choices made here; the SQL/storage layer didn't change shape (only the
+    `SWIFT_FETCH_DATABASE` override fn was added, and the graph edge
+    documented in ADR-0023 was unlocked for these callers).
+  - `download`'s auto-extract flag, its collision policy, and the
+    extraction-trigger laws from ADR-0022 stay as recorded; Phase 11 adds
+    no extraction surface beyond mapping `--no-extract` through config.
+  - Phase 11 does not add GUI pigment, telemetry, or a persistent
+    resident process (the PRD excludes them); every command is a
+    one-shot process invocation.
+
 
 
 

@@ -1,27 +1,32 @@
-//! Application orchestration: argument validation and command dispatch.
+//! Application orchestration: command dispatch.
 //!
-//! Phase 1 defines the command surface; no command is wired to an
-//! implementation yet. Dispatch therefore reports a typed, honest
-//! not-implemented error instead of fabricating success. Wiring happens
-//! phase by phase (`DOCS/phases.md`).
+//! Phase 11 wires every command to the implemented services: `download`
+//! drives the batch scheduler under graceful shutdown with live progress;
+//! `status`, `resume`, and `retry` operate on the persisted queue through
+//! the command handlers ([`commands_handler`]). Dispatch owns no transfer
+//! or storage logic of its own — it routes the parsed CLI contract to the
+//! handler that owns the plumbing and maps nothing about success or
+//! failure beyond what the handlers report ([`CommandEnd`], [`AppError`]).
 
 pub(crate) mod batch;
 mod commands_handler;
 
 use crate::cli::{Cli, Commands};
 use crate::error::AppError;
-use commands_handler::{handle_download, handle_queue_command, QueueCommand};
+use commands_handler::{handle_download, handle_resume, handle_retry, handle_status, CommandEnd};
 
 /// Runs the already-parsed CLI contract.
 ///
-/// This is the application entry point between the CLI layer and, in later
-/// phases, the download engine, storage, and archive layers.
-pub fn run(cli: &Cli) -> Result<(), AppError> {
+/// This is the application entry point between the CLI layer and the
+/// engine, storage, and archive layers. It is async because the download
+/// workflows are; `main` builds the runtime around it (current-thread,
+/// explicitly — no bootstrap macro).
+pub async fn run(cli: &Cli) -> Result<CommandEnd, AppError> {
     match &cli.command {
-        Commands::Download(args) => handle_download(args),
-        Commands::Status => handle_queue_command(QueueCommand::Status),
-        Commands::Resume => handle_queue_command(QueueCommand::Resume),
-        Commands::Retry => handle_queue_command(QueueCommand::Retry),
+        Commands::Download(args) => handle_download(args).await,
+        Commands::Status => handle_status(),
+        Commands::Resume => handle_resume().await,
+        Commands::Retry => handle_retry().await,
     }
 }
 
@@ -32,44 +37,37 @@ mod tests {
     use crate::error::ErrorCategory;
     use clap::Parser;
 
-    #[test]
-    fn every_queue_command_reports_not_implemented_in_phase_1() {
-        for command in ["status", "resume", "retry"] {
-            let cli =
-                Cli::try_parse_from(["swift-fetch", command]).expect("valid subcommand must parse");
-            let error = run(&cli).expect_err("phase 1 must not claim success for any command");
-            assert_eq!(error.category(), ErrorCategory::NotYetImplemented);
-            assert!(
-                error.message().contains(command),
-                "message must name the executed command: {}",
+    /// Phase 11 wiring keeps the Phase 1 order guarantee: obviously invalid
+    /// `download` input is rejected before any service is opened (no
+    /// database is created, nothing is queued, nothing is fetched), and the
+    /// error lands in the invalid-invocation category (exit 2 in `main`).
+    ///
+    /// Valid-input dispatch is exercised end to end by the integration
+    /// suite (`tests/cli.rs`) against the controlled local mock server,
+    /// with the database redirected via `SWIFT_FETCH_DATABASE` — unit tests
+    /// must never touch the user's real application-data directory.
+    #[tokio::test]
+    async fn download_validation_errors_are_invalid_invocations() {
+        for args in [
+            vec!["download"],                          // no input at all
+            vec!["download", "ftp://host/f"],          // wrong scheme
+            vec!["download", "-j", "0", "http://h/f"], // non-positive concurrency
+            vec!["download", "-s", "0", "http://h/f"], // non-positive segmentation
+            vec!["download", "-o", "", "http://h/f"],  // empty output directory
+        ] {
+            let mut invocation = vec!["swift-fetch"];
+            invocation.extend_from_slice(&args);
+            let cli = Cli::try_parse_from(invocation)
+                .unwrap_or_else(|error| panic!("inputs {args:?} must parse: {error}"));
+            let error = run(&cli)
+                .await
+                .expect_err("invalid input must never run a command");
+            assert_eq!(
+                error.category(),
+                ErrorCategory::Input,
+                "invalid input is an invalid invocation: {}",
                 error.message()
             );
         }
-    }
-
-    #[test]
-    fn download_with_valid_arguments_reports_not_implemented() {
-        let cli = Cli::try_parse_from([
-            "swift-fetch",
-            "download",
-            "https://localhost:9000/fixture.bin",
-        ])
-        .expect("valid download arguments must parse");
-        let error = run(&cli).expect_err("phase 1 must not claim download success");
-        assert_eq!(error.category(), ErrorCategory::NotYetImplemented);
-        assert!(error.message().contains("download"));
-    }
-
-    #[test]
-    fn download_validation_errors_precede_the_not_implemented_guard() {
-        let cli = Cli::try_parse_from(["swift-fetch", "download", "ftp://host/f"])
-            .expect("arguments must parse");
-        let error = run(&cli).expect_err("invalid URL must be rejected early");
-        assert_eq!(error.category(), ErrorCategory::Input);
-
-        let cli = Cli::try_parse_from(["swift-fetch", "download", "-j", "0", "https://host/f"])
-            .expect("arguments must parse");
-        let error = run(&cli).expect_err("non-positive concurrency must be rejected early");
-        assert_eq!(error.category(), ErrorCategory::Input);
     }
 }
