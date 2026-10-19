@@ -63,7 +63,7 @@ use crate::download::sequential::{
 };
 use crate::error::{AppError, ErrorCategory};
 use crate::logging::redact_url;
-use crate::storage::file_writer::{finalize, reserve_destination, PartialFile};
+use crate::storage::file_writer::{ensure_output_dir, finalize, reserve_destination, PartialFile};
 use crate::storage::repository::{
     DownloadRecord, DownloadState, NewDownload, NewExtraction, NewSegment, Repository,
     SegmentRecord, SegmentState, TransferFacts,
@@ -897,6 +897,13 @@ fn reconcile_download(repo: &Repository, record: DownloadRecord) -> Result<Recov
         ));
     };
 
+    // The partial scan needs the directory to exist: a recorded destination
+    // that was never created yet (fresh nested output, wiped workspace) is
+    // created on demand before the engine looks for previous transfers'
+    // partial files — `PartialFile::create` would do the same inside the
+    // attempt, and refusing a missing-but-creatable directory here would
+    // make such destinations permanently unrecoverable.
+    ensure_output_dir(dir)?;
     let candidates = scan_partials(dir, &record.file_name)?;
     let Some(partial_path) = candidates
         .into_iter()

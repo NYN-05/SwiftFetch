@@ -28,10 +28,6 @@
 //! each positioned once at the start of its own non-overlapping byte range,
 //! so no two workers ever share a mutable file cursor.
 
-// Phase 4 wiring note: commands call this module from Phase 11; unit tests
-// exercise it in the meantime (narrow `dead_code` waiver per AGENTS.md).
-#![allow(dead_code)]
-
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -110,10 +106,16 @@ impl PartialFile {
         );
         ensure_output_dir(dir)?;
         let sequence = PARTIAL_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "{name}.swiftfetch-{}-{sequence}.part",
-            process::id()
-        ));
+        let suffix = format!(".swiftfetch-{}-{sequence}.part", process::id());
+        // A capped final name already uses the full 255 UTF-16 component
+        // budget; appending the engine namespace would overflow the
+        // per-component limit again and deny *creation* (long paths widen
+        // the total path, never the component). The stem is re-capped so
+        // the whole partial component fits. Recovery still owns the
+        // record's real file name; a partial beyond the cap can no longer
+        // prefix-match that name and degrades to an honest full restart.
+        let stem = cap_units(name, suffix.encode_utf16().count());
+        let path = dir.join(format!("{stem}{suffix}"));
         let file = tokio::fs::File::create(&path).await.map_err(|err| {
             fs_failure(
                 format!(
