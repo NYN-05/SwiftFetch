@@ -1517,6 +1517,168 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
   records only its own commit hash and fresh-clone results.
 
 
+## Phase 10 - Safe Automatic ZIP Extraction
+
+- **Date:** 2026-10-19
+- **Version:** `0.11.0` → `0.12.0`
+- **Outcome:** Phase 10 exit gate met for the extraction scope. A
+  successfully finalized ZIP extracts automatically into a dedicated
+  sibling folder while every reliability law holds: unsafe entry names
+  cannot write outside the destination; existing files are never
+  silently overwritten; a failed or hostile extraction preserves the
+  archive byte-for-byte and reports separately; extraction progress
+  lives on its own ledger (`extractions` table) and is retriable with
+  no network surface anywhere in the module; and the download record
+  never flips because extraction failed. The transfer engine requests
+  extraction only at finalization - after the same-volume rename lands
+  the final name and before the engine call returns - awaited inline so
+  one engine call returns with extraction settled (completed,
+  recorded-failed, or skipped by configuration), never pending in the
+  background. Detection is local and magic-first (the three ZIP
+  signatures); the name and extension are hints only.
+- **Files changed (across the four commits disclosed below):**
+  - `src/archive/zip_extract.rs` - the sealed extractor: entry-name
+    validation (rooted names, `..` components, drive/UNC prefixes,
+    non-UTF-8 names, unconditional Windows reserved device stems,
+    filesystem-resolved containment with ancestor-walk resolution), the
+    claim screen plus write-side size enforcement (1 GiB per entry /
+    10 GiB cumulative defaults, violating partials removed), the
+    collision policy (skip-and-report by default; explicit
+    remove-then-write replacement), the record lifecycle
+    (`queued` → `extracting` → `completed`/`failed` with `(category,
+    message)` details on every failure path including pre-`extracting`
+    refusals), the async entry point taking `&Repository` for retry
+    without redownload, and 13 inline tests.
+  - `src/download/resume.rs` - engine wiring: `transfer_persisted`
+    gains a tenth parameter `zip_auto_extract: bool` (after the
+    shutdown handle; supersedes ADR-0021's recorded count), awaited
+    extraction in the finalization step behind the local magic-byte
+    gate (`is_zip_file`: `PK\x03\x04`/`PK\x05\x06`/`PK\x07\x08`; a
+    failed extraction is logged and recorded but never breaks the
+    completed download), `determine_extract_dir` deduplicated into the
+    archive module, and 5 engine tests (auto-extract tracked
+    separately, skipped-when-disabled, corrupt ZIP completes with a
+    failed extraction record and stays idempotent on re-invocation, no
+    extraction without finalization, magic-bytes-not-filename
+    detection).
+  - `src/archive/mod.rs` - module re-exports (`extract_zip`,
+    `ExtractionConfig`; the crate-internal
+    `determine_extract_dir`).
+  - `src/app/batch.rs` - threads `zip_auto_extract` into every engine
+    call (currently the default `true` with the recorded Phase 11 TODO
+    to map config).
+  - `src/cli/commands.rs` / `src/config.rs` / `src/cli/mod.rs` -
+    `--no-extract` and its `zip_auto_extract` mapping, locked by
+    mapping/default tests (landed pre-checkpoint on 2026-10-18; the
+    last touch is `56e7501`).
+  - `tests/common/server.rs` - the `raw_body`/`with_raw_body` mock knob
+    so genuine ZIP bytes can be served (the mocked wire behavior is
+    locked by three new tests in `tests/mock_server.rs`: byte-for-byte
+    GET with exact length, honored 206 ranges slicing exactly, HEAD
+    advertising the exact length; broken/truncate countdowns work on
+    raw bodies unchanged).
+  - `tests/mock_server.rs` - the three knob tests above.
+  - `Cargo.toml`/`Cargo.lock` - `zip` (default-features off,
+    `deflate` only) adding no unused codecs; version `0.12.0`.
+- **Disclosure - tracking law versus how this code landed.** The phase
+  implementation reached the repository across four `feat:`-styled
+  commits instead of one phase-styled commit carrying code + entry:
+  `cde0a21` (first engine + wiring + batch flag, 850 insertions),
+  `d599fb6` (engine rewrite toward the final shape), then two
+  operator-authored mid-session snapshots - `105639d` (the completed
+  engine, wiring, mock knob and lock pruning, 1360 insertions,
+  19:58 +0530) and `f1ffb13` (version bump, ADR-0022, the mock knob
+  tests, 20:05 +0530) - both pushed by the operator outside the
+  session's commands. No entry existed for any of them until this one;
+  per ADR-0010 nothing is rewritten, combined, or retroactively
+  restyled. This entry completes the recording duty; the addendum that
+  follows after the phase records the entry commit hash and the
+  fresh-clone gate results.
+- **Disclosure - Phase 9's absent entry.** Phase 9 (crash consistency
+  and segmented recovery) has phase-styled code commits (`abe2648`,
+  46 lines in `resume.rs`; `694ab82` version bump) but never received a
+  `changes.md` entry: the file ended at the Phase 8 verification
+  addendum until this section. The untracked `722b70f` "Refactor"
+  commit (a 4,396-line rewrite of `resume.rs` that introduced the
+  segmented-recovery engine and its tests) sits between the Phase 8
+  addendum and Phase 9's commit with no verification record anywhere.
+  Recorded as a disclosed gap, not backfilled (ADR-0010).
+- **Pre-existing failures (inherited, not Phase 10 regressions).** The
+  unit target reports 7 failures; all 7 fail identically in a detached
+  worktree checked out at `a650ecf` (the last commit before any Phase 10
+  work - there the `segmented` filter gives 18 passed / 6 failed, and
+  `a_truncated_segment_is_retried...` gives 0 passed / 1 failed):
+  `segmented_recovery_failed_segment_retried`,
+  `segmented_recovery_handles_oversized_partial`,
+  `segmented_recovery_handles_truncated_partial`,
+  `segmented_recovery_handles_unknown_size`,
+  `segmented_recovery_shutdown_parks_paused`,
+  `segmented_recovery_skips_verified_completed_segments`,
+  `a_truncated_segment_is_retried_within_the_budget_and_never_finalized_early`.
+  They belong to Phase 9's unverified crash-consistency/recovery
+  lineage (`722b70f` + `abe2648`); repairing engine or test behavior
+  there is a Phase 9 concern under the phase-boundary law and was
+  deliberately not touched by Phase 10. The owner must sanction that
+  repair separately.
+- **Defects caught before the phase recorded green.**
+  - *Windows verbatim-path containment false positive (the serious
+    one).* `canonicalize` returns a verbatim `\\?\` path for the
+    extract root while a fresh (not-yet-existing) leaf's joined path
+    stays plain, so the containment comparison matched a VerbatimDisk
+    prefix against a Disk prefix and refused every fresh entry as
+    "extraction would escape the root directory" - detected because the
+    corrupt-archive engine test (expected-fail) passed while the
+    valid-archive engine test failed with a `Failed` extraction row.
+    Fixed by resolving a fresh leaf through its deepest existing
+    canonical ancestor and re-appending the missing names, keeping the
+    comparison on one canonical form (ADR-0022 item 4); regression
+    test `a_fresh_leaf_under_a_plain_root_passes_containment`.
+  - *Mid-stream shutdown raced a single-frame body.* The mock streams
+    in 512-byte frames; a 187-byte ZIP arrived inside one frame and
+    completed before the 120 ms shutdown trip. The no-finalization test
+    now serves an incompressible ~8 KiB entry (~17 frames at 50 ms) so
+    the trip lands mid-body deterministically.
+  - *Lifecycle jump in the retry unit test* (`queued → completed` is
+    not an ADR-0018 edge): the record now walks
+    probing → downloading → finalizing → completed, and the test states
+    its destination explicitly so the staged obstacle engages the
+    engine's derived path.
+- **Verification - actual results (all run on Windows, against the
+  tree that became `f1ffb13`; scratch outputs retained under the
+  session temp dir):**
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, exit 0 (4.6 s) |
+| `cargo test` (unit target) | 253 passed, 7 failed - the 7 pre-existing per the section above; `cargo test` fail-fasts at the failing unit target, so the CLI target is observed separately |
+| `cargo test --test cli` | 11 passed, 0 failed (2.6 s) |
+| `cargo test --test fixtures` | 15 passed, 0 failed |
+| `cargo test --test mock_server` | 33 passed, 0 failed (2.1 s) - includes the 3 raw-payload knob tests |
+
+  - Extraction tests observed green, 18 in total: 13 inline in
+    `zip_extract.rs` and 5 engine tests in `resume.rs` (listed under
+    Files changed), plus the 3 mock tests locking `with_raw_body`.
+- **Scope-control notes:**
+  - Phase 11 maps `--no-extract` through `run_batch`; the batch call
+    site passes the default `true` with its recorded TODO. The
+    commands/config mapping and its tests are locked from the earlier
+    landing.
+  - Extraction limits stay engine-fixed (1 GiB / 10 GiB); no caller
+    surface was added this phase (ADR-0022 consequences).
+  - The repository layer still round-trips extraction states without
+    transition validation (Phase 5 contract, unchanged); the engine's
+    writes observed by tests follow `queued → extracting →
+    completed|failed` including pre-`extracting` refusals marking
+    `failed` directly.
+  - Partial extraction states are honest: a mid-run failure leaves
+    already-written files, a `failed` record with its message, the
+    archive intact, and the download still `completed`.
+  - Scratch outputs for this phase's runs live in the session temp dir
+    (`clippy.txt`/`test.txt`/`test3.txt`, `baseline_wt.txt` and
+    friends); entries record only actually observed results.
+
+
 
 
 
