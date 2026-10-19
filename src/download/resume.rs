@@ -5516,4 +5516,3 @@ mod tests {
         Ok(format!("{:x}", hasher.finalize()))
     }
 }
-
