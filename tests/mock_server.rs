@@ -509,3 +509,157 @@ async fn unknown_routes_answer_404_sentinel() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_bytes(response).await.as_ref(), b"status-404");
 }
+
+// ---------------------------------------------------------------------
+// Phase 8 knobs: range switching, segment-shaped failures, unknown totals,
+// and the active-GET concurrency gauge.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_range_switch_after_the_probe_is_answered_by_the_replacement_mode() {
+    let (_server, url) = one_route(
+        "/f",
+        Behavior::default().with_range_switch_after(1, RangeMode::Ignore),
+    )
+    .await;
+    let fixture = Fixture::default();
+    let client = http_client();
+
+    // The first ranged GET (the probe's evidence request) is honored...
+    let probe = send(&client, &url, Method::GET, Some("bytes=0-0")).await;
+    assert_eq!(probe.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(&probe, &CONTENT_RANGE),
+        format!("bytes 0-0/{}", fixture.len)
+    );
+    assert_eq!(body_bytes(probe).await.as_ref(), &fixture.bytes()[..1]);
+
+    // ...every later ranged GET is answered with the full representation.
+    for _ in 0..2 {
+        let ignored = send(&client, &url, Method::GET, Some("bytes=512-1023")).await;
+        assert_eq!(ignored.status(), StatusCode::OK);
+        assert_eq!(
+            body_bytes(ignored).await.as_ref(),
+            fixture.bytes().as_ref(),
+            "the ignored range answers the whole resource"
+        );
+    }
+}
+
+#[tokio::test]
+async fn truncate_after_probe_only_drops_transfer_shaped_ranges() {
+    let (_server, url) =
+        one_route("/f", Behavior::default().with_truncate_after_probe(1, 100)).await;
+
+    // The probe range is exempt: it arrives complete.
+    let client = http_client();
+    let probe = send(&client, &url, Method::GET, Some("bytes=0-0")).await;
+    assert_eq!(probe.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(probe).await.as_ref().len(), 1);
+
+    // The first transfer-shaped range is cut after 100 bytes...
+    let client = http_client();
+    match try_send(&client, &url, Method::GET, Some("bytes=0-511")).await {
+        None => {}
+        Some(response) => {
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert!(
+                response.into_body().collect().await.is_err(),
+                "the segment body must end before its promised length"
+            );
+        }
+    }
+
+    // ...and the countdown is spent: the next range is complete.
+    let client = http_client();
+    let healthy = send(&client, &url, Method::GET, Some("bytes=0-511")).await;
+    assert_eq!(healthy.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(healthy).await.as_ref().len(), 512);
+}
+
+#[tokio::test]
+async fn segment_status_overrides_only_transfer_shaped_ranges() {
+    let (_server, url) = one_route("/f", Behavior::default().with_segment_status(500)).await;
+    let fixture = Fixture::default();
+    let client = http_client();
+
+    let probe = send(&client, &url, Method::GET, Some("bytes=0-0")).await;
+    assert_eq!(probe.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(probe).await.as_ref().len(), 1);
+
+    let segment = send(&client, &url, Method::GET, Some("bytes=0-511")).await;
+    assert_eq!(segment.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body_bytes(segment).await.as_ref(), b"status-500");
+
+    // Unranged GETs (a sequential fallback) keep succeeding.
+    let full = send(&client, &url, Method::GET, None).await;
+    assert_eq!(full.status(), StatusCode::OK);
+    assert_eq!(body_bytes(full).await.as_ref(), fixture.bytes().as_ref());
+}
+
+#[tokio::test]
+async fn omit_range_total_answers_unknown_totals_without_a_length() {
+    let (_server, url) = one_route(
+        "/f",
+        Behavior::default()
+            .with_omit_range_total(true)
+            .with_omit_content_length(true),
+    )
+    .await;
+    let fixture = Fixture::default();
+    let client = http_client();
+
+    let response = send(&client, &url, Method::GET, Some("bytes=0-0")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header(&response, &CONTENT_RANGE), "bytes 0-0/*");
+    assert_eq!(
+        header_opt(&response, &CONTENT_LENGTH),
+        None,
+        "the unknown-size answer omits Content-Length"
+    );
+    assert_eq!(body_bytes(response).await.as_ref(), &fixture.bytes()[..1]);
+}
+
+#[tokio::test]
+async fn overrun_ranges_stream_past_their_content_range() {
+    let (_server, url) = one_route("/f", Behavior::default().with_overrun_range_by(1_000)).await;
+    let fixture = Fixture::default();
+    let client = http_client();
+
+    let response = send(&client, &url, Method::GET, Some("bytes=0-511")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header(&response, &CONTENT_RANGE), "bytes 0-511/4096");
+    assert_eq!(
+        header_opt(&response, &CONTENT_LENGTH),
+        None,
+        "the overlong body is chunked"
+    );
+    let body = body_bytes(response).await;
+    assert_eq!(
+        body.len(),
+        1_512,
+        "512 promised bytes plus the 1000-byte overrun"
+    );
+    assert_eq!(body.as_ref(), &fixture.bytes()[..1_512]);
+}
+
+#[tokio::test]
+async fn the_active_get_gauge_sees_overlapping_bodies() {
+    let (server, url) = one_route("/f", Behavior::default().with_delay_body_ms(30)).await;
+    let client = http_client();
+
+    let (first, second) = tokio::join!(
+        send(&client, &url, Method::GET, None),
+        send(&client, &url, Method::GET, None),
+    );
+    let first = body_bytes(first).await;
+    let second = body_bytes(second).await;
+    let fixture = Fixture::default();
+    assert_eq!(first.as_ref(), fixture.bytes().as_ref());
+    assert_eq!(second.as_ref(), fixture.bytes().as_ref());
+    assert!(
+        server.peak_active_gets() >= 2,
+        "two overlapping delayed bodies must be observable, peak was {}",
+        server.peak_active_gets()
+    );
+}

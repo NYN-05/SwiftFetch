@@ -53,6 +53,10 @@ use crate::download::probe::{
 };
 use crate::download::progress::Progress;
 use crate::download::retry::{classify, RetryPolicy, RetryVerdict};
+use crate::download::segmented::{
+    download_segments, PlannedSegment, SegmentBatchEnd, SegmentContext, SegmentSpan,
+    SegmentationPolicy,
+};
 use crate::download::sequential::{
     expected_size_of, select_filename, with_transfer_context, SequentialDownload,
 };
@@ -289,8 +293,9 @@ struct Attempt<'a> {
     repo: &'a Repository,
     url: &'a str,
     output_dir: &'a Path,
-    progress: &'a Progress,
+    progress: Arc<Progress>,
     shutdown: &'a ShutdownHandle,
+    segmentation: &'a SegmentationPolicy,
     now: fn() -> u64,
 }
 
@@ -471,10 +476,11 @@ async fn run_attempt(ctx: &Attempt<'_>, plan: RecoveryPlan) -> Result<AttemptOut
 /// recovery contract; returns when the transfer completed, failed
 /// terminally, or shutdown was requested.
 ///
-/// The caller owns shutdown (`shutdown`) and the retry budget (`policy`);
-/// the progress handle exists for diagnostics and tests. The eight
-/// parameters are the deliberate contract of the engine entry point (the
-/// Phase 11 command wiring is its only caller).
+/// The caller owns shutdown (`shutdown`), the retry budget (`policy`), and
+/// the segmentation limits (`segmentation`); the progress handle exists for
+/// diagnostics and tests. The nine parameters are the deliberate contract
+/// of the engine entry point (the Phase 11 command wiring is its only
+/// caller).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn transfer_persisted(
     client: &HttpClient,
@@ -483,6 +489,7 @@ pub(crate) async fn transfer_persisted(
     output_dir: &Path,
     progress: Arc<Progress>,
     policy: &RetryPolicy,
+    segmentation: &SegmentationPolicy,
     now: fn() -> u64,
     shutdown: &ShutdownHandle,
 ) -> Result<SequentialDownload, AppError> {
@@ -491,8 +498,9 @@ pub(crate) async fn transfer_persisted(
         repo,
         url,
         output_dir,
-        progress: &progress,
+        progress,
         shutdown,
+        segmentation,
         now,
     };
     let mut transient_failures: u32 = 0;
@@ -1106,6 +1114,55 @@ async fn full_transfer(
     partial_path: Option<PathBuf>,
     response_in_hand: Option<reqwest::Response>,
 ) -> Result<AttemptOutcome, AppError> {
+    let mut partial_path = partial_path;
+    // Phase 8: segmentation is an opportunistic strategy, chosen from the
+    // probe's proven facts before a full-body GET is wasted. A response
+    // already in hand (a ranged restart that received a legal full 200) is
+    // always streamed sequentially: its bytes are fresh content.
+    if response_in_hand.is_none() {
+        if let Some((total, spans)) = ctx.segmentation.plan_for_probe(facts) {
+            tracing::info!(
+                "transfer of {}: the probe proved byte ranges and a known {total}-byte \
+                 size; fetching {} concurrent segments",
+                redacted,
+                spans.len()
+            );
+            let temp = match partial_path.take() {
+                Some(path) => PartialFile::resume_at(path, 0).await?,
+                None => PartialFile::create(ctx.output_dir, &file_name).await?,
+            };
+            let segmented_path = temp.path().to_path_buf();
+            match segmented_transfer(
+                ctx,
+                record_id,
+                &file_name,
+                &effective_url,
+                &redacted,
+                facts,
+                total,
+                spans,
+                temp,
+            )
+            .await?
+            {
+                SegmentedOutcome::Completed(download) => {
+                    return Ok(AttemptOutcome::Completed(download))
+                }
+                SegmentedOutcome::Interrupted => return Ok(AttemptOutcome::Interrupted),
+                SegmentedOutcome::Fallback { reason } => {
+                    // The aborted plan's rows are retired and its partial is
+                    // truncated inside the segmented attempt; the same
+                    // attempt continues with a clean sequential fetch.
+                    tracing::info!(
+                        "the segmented transfer of {} is unsafe and falls back to a \
+                         sequential transfer: {reason}",
+                        redacted
+                    );
+                    partial_path = Some(segmented_path);
+                }
+            }
+        }
+    }
     let mut response = match response_in_hand {
         Some(response) => response,
         None => {
@@ -1175,6 +1232,180 @@ async fn full_transfer(
         (StreamEnd::Completed { .. }, None) => {
             unreachable!("a completed stream hands its partial back for the rename")
         }
+    }
+}
+
+/// How one segmented attempt ended before finalization.
+enum SegmentedOutcome {
+    /// Every span was written, synced, and recorded; the file was finalized.
+    Completed(SequentialDownload),
+    /// Shutdown parked the transfer with its confirmed segment rows intact.
+    Interrupted,
+    /// Range behavior was unsafe; the caller must continue sequentially in
+    /// the same attempt (the plan's rows are retired and its bytes were
+    /// discarded before this value is returned).
+    Fallback { reason: &'static str },
+}
+
+/// Runs one planned segmented transfer over an already-created (or
+/// truncated) partial file.
+///
+/// The plan's rows are inserted `Pending` before any worker starts, workers
+/// own their spans, and every ending is honest about what the store and the
+/// partial may claim:
+///
+/// - completion finalizes only after every worker's row is `Completed`;
+/// - shutdown parks the record `paused` with the workers' confirmed rows;
+/// - a fallback or a worker error retires the rows and truncates the
+///   partial to zero before returning, so the sequential fallback (or a
+///   retry) never appends to an aborted plan's output.
+#[allow(clippy::too_many_arguments)] // the attempt is parameterized, not accidental
+async fn segmented_transfer(
+    ctx: &Attempt<'_>,
+    record_id: i64,
+    file_name: &str,
+    effective_url: &reqwest::Url,
+    redacted: &str,
+    facts: &ProbeResult,
+    total: u64,
+    spans: Vec<SegmentSpan>,
+    temp: PartialFile,
+) -> Result<SegmentedOutcome, AppError> {
+    // A new plan supersedes any rows an earlier attempt left behind; the
+    // retired rows remain as history (rows are never deleted).
+    retire_segments(ctx.repo, record_id)?;
+    let mut planned = Vec::with_capacity(spans.len());
+    let segment_count = spans.len();
+    for span in spans {
+        let id = ctx.repo.insert_segment(
+            record_id,
+            NewSegment {
+                min_byte: span.min_byte,
+                max_byte: span.max_byte,
+                state: SegmentState::Pending,
+                received_bytes: 0,
+            },
+        )?;
+        planned.push(PlannedSegment { id, span });
+    }
+    ctx.progress.continue_from(0);
+
+    let partial_path = temp.path().to_path_buf();
+    let context = SegmentContext {
+        client: ctx.client.clone(),
+        repo: Arc::new(ctx.repo.clone()),
+        effective_url: effective_url.clone(),
+        redacted: redacted.to_owned(),
+        total,
+        partial_path: partial_path.clone(),
+        progress: Arc::clone(&ctx.progress),
+        shutdown: ctx.shutdown.clone(),
+    };
+    match download_segments(context, planned).await {
+        Ok(SegmentBatchEnd::Completed) => {
+            // Every worker synced its span and recorded completion; before
+            // the rename, one last check that the file on disk really holds
+            // the validated total — a lost or short write must never
+            // finalize (the same retryable length-violation shape as the
+            // workers' own premature-end refusal).
+            let on_disk = tokio::fs::metadata(&partial_path).await.map_err(|err| {
+                AppError::new(
+                    ErrorCategory::Filesystem,
+                    format!(
+                        "the partial file {} could not be measured before \
+                             finalization: {err}",
+                        partial_path.display()
+                    ),
+                )
+                .with_source(err)
+            })?;
+            if on_disk.len() != total {
+                let err = AppError::new(
+                    ErrorCategory::RangeValidation,
+                    format!(
+                        "the segmented transfer of {redacted} wrote {} of the expected \
+                         {total} bytes; the incomplete file will not be finalized",
+                        on_disk.len()
+                    ),
+                )
+                .with_source(HttpFailure::transport());
+                drop(temp);
+                discard_segments(ctx.repo, record_id, &partial_path).await;
+                return Err(err);
+            }
+            // The rename is the only step that may still fail.
+            let moved = finalize_claimed(
+                ctx,
+                record_id,
+                DownloadState::Downloading,
+                temp,
+                file_name,
+                &ctx.output_dir.join(file_name),
+            )
+            .await?;
+            tracing::info!(
+                "download {record_id}: the {segment_count}-segment transfer of {redacted} finalized"
+            );
+            Ok(SegmentedOutcome::Completed(SequentialDownload {
+                destination: moved,
+                file_name: file_name.to_owned(),
+                bytes_written: total,
+                expected_size: Some(total),
+                etag: facts.etag.clone(),
+                last_modified: facts.last_modified.clone(),
+                effective_url: facts.effective_url.clone(),
+            }))
+        }
+        Ok(SegmentBatchEnd::Interrupted) => {
+            ctx.repo
+                .update_status(record_id, DownloadState::Paused, (ctx.now)(), None)?;
+            tracing::info!(
+                "shutdown: the segmented transfer of {redacted} paused with its confirmed \
+                 segments"
+            );
+            Ok(SegmentedOutcome::Interrupted)
+        }
+        Ok(SegmentBatchEnd::Fallback { reason }) => {
+            drop(temp);
+            discard_segments(ctx.repo, record_id, &partial_path).await;
+            Ok(SegmentedOutcome::Fallback { reason })
+        }
+        Err(err) => {
+            drop(temp);
+            discard_segments(ctx.repo, record_id, &partial_path).await;
+            Err(err)
+        }
+    }
+}
+
+/// Retires every non-`failed` segment row of a record, preserving the rows
+/// as inspectable history (the Phase 6 retirement convention).
+fn retire_segments(repo: &Repository, record_id: i64) -> Result<(), AppError> {
+    for row in repo.list_segments(record_id)? {
+        if row.state != SegmentState::Failed {
+            repo.update_segment(row.id, SegmentState::Failed, 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort cleanup of an aborted plan: retire its rows and truncate its
+/// partial to zero. Cleanup failures are logged and never mask the transfer
+/// error that caused the discard; a later attempt reopens the same file with
+/// the same offset-zero truncation discipline.
+async fn discard_segments(repo: &Repository, record_id: i64, partial_path: &Path) {
+    if let Err(err) = retire_segments(repo, record_id) {
+        tracing::warn!(
+            "the aborted segment plan of download record {record_id} could not be retired: {}",
+            err.message()
+        );
+    }
+    if let Err(err) = PartialFile::resume_at(partial_path.to_path_buf(), 0).await {
+        tracing::warn!(
+            "the partial file {} could not be truncated after the aborted segment plan: {}",
+            partial_path.display(),
+            err.message()
+        );
     }
 }
 
@@ -1596,8 +1827,14 @@ fn ensure_segment(
             return Ok(Some((**newest).clone()));
         }
     }
-    for row in &usable {
-        repo.update_segment(row.id, SegmentState::Failed, 0)?;
+    // Every remaining row is superseded: a mismatched whole-range plan, or a
+    // segmented plan's spans whose bytes this sequential pass overwrites.
+    // Retirement keeps the history inspectable (rows are never deleted)
+    // without leaving a stale in-progress claim behind.
+    for row in &rows {
+        if row.state != SegmentState::Failed {
+            repo.update_segment(row.id, SegmentState::Failed, 0)?;
+        }
     }
     repo.insert_segment(
         record_id,
@@ -1835,6 +2072,7 @@ mod tests {
             dir,
             Progress::shared(),
             &RetryPolicy::from_retries(retries),
+            &SegmentationPolicy::default(),
             test_clock,
             &handle,
         )
@@ -2296,6 +2534,7 @@ mod tests {
             scratch.path(),
             Progress::shared(),
             &RetryPolicy::from_retries(5),
+            &SegmentationPolicy::default(),
             test_clock,
             &handle,
         )
@@ -2522,6 +2761,7 @@ mod tests {
                     &dir,
                     task_progress,
                     &RetryPolicy::from_retries(5),
+                    &SegmentationPolicy::default(),
                     test_clock,
                     &handle,
                 )
@@ -2899,6 +3139,7 @@ mod tests {
                     &dir,
                     Progress::shared(),
                     &slow,
+                    &SegmentationPolicy::default(),
                     test_clock,
                     &handle,
                 )
@@ -3113,6 +3354,662 @@ mod tests {
                 .expect("final file")
                 .as_slice(),
             fixture.bytes().as_slice()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 8: segmented transfers against the mock server. A test-scale
+    // policy keeps every scenario small; the production defaults (32 MiB /
+    // 8 MiB) are exercised by the planner's unit tests.
+    // ---------------------------------------------------------------------
+
+    /// A test-scale segmentation policy; the real thresholds start at
+    /// 32 MiB (`DOCS/architecture.md` §6), which no mock fixture reaches.
+    fn small_segments(segment_size: u64, max_segments: u32) -> SegmentationPolicy {
+        SegmentationPolicy {
+            min_file_size: 1,
+            segment_size,
+            max_segments,
+        }
+    }
+
+    /// Runs the persisted engine under one segmentation policy.
+    async fn drive_segmented(
+        repo: &Repository,
+        server: &MockServer,
+        path: &str,
+        dir: &Path,
+        retries: u32,
+        policy: &SegmentationPolicy,
+    ) -> Result<SequentialDownload, AppError> {
+        let client = HttpClient::default_client().expect("the default client builds");
+        let url = server.url(path);
+        let (_signal, handle) = ShutdownSignal::channel();
+        transfer_persisted(
+            &client,
+            repo,
+            &url,
+            dir,
+            Progress::shared(),
+            &RetryPolicy::from_retries(retries),
+            policy,
+            test_clock,
+            &handle,
+        )
+        .await
+    }
+
+    /// Every raw `Range` header seen by one route, in arrival order.
+    fn ranged_values(server: &MockServer, path: &str) -> Vec<String> {
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "GET" && request.path == path)
+            .filter_map(|request| request.range.clone())
+            .collect()
+    }
+
+    /// The ranged GETs that carry a planned span (not the probe's
+    /// `bytes=0-0` evidence request).
+    fn transfer_ranges(server: &MockServer, path: &str) -> Vec<String> {
+        ranged_values(server, path)
+            .into_iter()
+            .filter(|value| value != "bytes=0-0")
+            .collect()
+    }
+
+    /// Unranged GETs of one route (the sequential path's signature).
+    fn unranged_gets(server: &MockServer, path: &str) -> usize {
+        server
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.path == path && request.range.is_none()
+            })
+            .count()
+    }
+
+    /// The segment rows of the only download record (tests use one scope).
+    fn sole_rows(repo: &Repository) -> Vec<SegmentRecord> {
+        let record = repo
+            .list_downloads()
+            .expect("downloads listed")
+            .into_iter()
+            .next()
+            .expect("one record exists");
+        repo.list_segments(record.id).expect("segments listed")
+    }
+
+    /// One segmented fallback's final ledger: the aborted plan's four spans
+    /// are retired `Failed` (claiming no bytes) and the sequential
+    /// continuation books exactly one completed whole-range row.
+    fn assert_fallback_ledger(repo: &Repository, total: u64) {
+        let rows = sole_rows(repo);
+        let failed: Vec<_> = rows
+            .iter()
+            .filter(|row| row.state == SegmentState::Failed)
+            .collect();
+        let completed: Vec<_> = rows
+            .iter()
+            .filter(|row| row.state == SegmentState::Completed)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            failed.len() + completed.len(),
+            "no span may hover between states after a fallback: {rows:?}"
+        );
+        assert_eq!(
+            failed.len(),
+            4,
+            "the whole aborted plan is retired: {rows:?}"
+        );
+        assert!(
+            failed.iter().all(|row| row.received_bytes == 0),
+            "a retired span claims nothing: {rows:?}"
+        );
+        assert_eq!(
+            completed.len(),
+            1,
+            "the fallback books one sequential row: {rows:?}"
+        );
+        let sequential = completed[0];
+        assert_eq!(
+            (
+                sequential.min_byte,
+                sequential.max_byte,
+                sequential.received_bytes
+            ),
+            (0, total - 1, total),
+        );
+    }
+
+    /// The error category a failed segmented invocation recorded.
+    fn failed_record_category(repo: &Repository) -> (DownloadState, Option<ErrorCategory>) {
+        let record = repo
+            .list_downloads()
+            .expect("downloads listed")
+            .into_iter()
+            .next()
+            .expect("one record exists");
+        (record.status, record.error_category)
+    }
+
+    #[tokio::test]
+    async fn a_segmented_transfer_writes_every_planned_span_and_stays_byte_exact() {
+        let fixture = Fixture::new(77, 10_000);
+        let server = MockServer::start().await;
+        server.mount_route("/segmented.bin", Behavior::default().with_fixture(fixture));
+        let (scratch, repo) = scratch_repo("segmented-happy");
+        let dir = scratch.path().to_owned();
+
+        // ceil(10000 / 3000) = 4 spans at the configured maximum; the last
+        // span is short (1000 bytes).
+        let policy = small_segments(3_000, 4);
+        let download = drive_segmented(&repo, &server, "/segmented.bin", &dir, 0, &policy)
+            .await
+            .expect("the segmented transfer completes");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice(),
+            "segmented output is byte-identical to the source"
+        );
+
+        // Exactly the planned spans were requested (order is scheduling).
+        let mut requested = transfer_ranges(&server, "/segmented.bin");
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                "bytes=0-2999",
+                "bytes=3000-5999",
+                "bytes=6000-8999",
+                "bytes=9000-9999",
+            ],
+            "the plan covers the object exactly once"
+        );
+        assert_eq!(
+            unranged_gets(&server, "/segmented.bin"),
+            0,
+            "a successful segmented transfer never falls back to a full GET"
+        );
+
+        // Every span is recorded completed with exactly its own byte count.
+        let rows = sole_rows(&repo);
+        let expected = [
+            (0u64, 2_999u64),
+            (3_000, 5_999),
+            (6_000, 8_999),
+            (9_000, 9_999),
+        ];
+        assert_eq!(rows.len(), expected.len());
+        for (row, (min, max)) in rows.iter().zip(expected) {
+            assert_eq!((row.min_byte, row.max_byte), (min, max));
+            assert_eq!(row.state, SegmentState::Completed);
+            assert_eq!(
+                row.received_bytes,
+                max - min + 1,
+                "a completed span claims its full length"
+            );
+        }
+        let record = repo
+            .get_download(repo.list_downloads().expect("list")[0].id)
+            .expect("read back")
+            .expect("present");
+        assert_eq!(record.status, DownloadState::Completed);
+        assert!(
+            scan_partials(&dir, "segmented.bin")
+                .expect("dir readable")
+                .is_empty(),
+            "no partial survives a completed finalization"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_segment_maximums_produce_two_three_and_four_spans() {
+        let fixture = Fixture::new(88, 30_000);
+        for expected_count in [2u32, 3, 4] {
+            let server = MockServer::start().await;
+            server.mount_route("/spans.bin", Behavior::default().with_fixture(fixture));
+            let (scratch, repo) = scratch_repo(&format!("spans-{expected_count}"));
+            let dir = scratch.path().to_owned();
+            let policy = small_segments(4_096, expected_count);
+            let download = drive_segmented(&repo, &server, "/spans.bin", &dir, 0, &policy)
+                .await
+                .unwrap_or_else(|err| panic!("max {expected_count} must complete: {err}"));
+            assert_eq!(download.bytes_written, fixture.len);
+            assert_eq!(
+                std::fs::read(&download.destination)
+                    .expect("final file")
+                    .as_slice(),
+                fixture.bytes().as_slice()
+            );
+            let rows = sole_rows(&repo);
+            assert_eq!(
+                rows.len(),
+                usize::try_from(expected_count).expect("small count"),
+                "max {expected_count} must plan exactly {expected_count} spans for this size"
+            );
+            assert!(
+                rows.iter().all(|row| row.state == SegmentState::Completed),
+                "every span of a completed transfer is completed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_file_workers_stay_within_the_configured_segment_maximum() {
+        let fixture = Fixture::new(99, 20_000);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/parallel.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_delay_body_ms(20),
+        );
+        let (scratch, repo) = scratch_repo("segmented-parallel");
+        let dir = scratch.path().to_owned();
+
+        // 20 000 / 5 000 = exactly 4 spans at the configured maximum.
+        let policy = small_segments(5_000, 4);
+        let download = drive_segmented(&repo, &server, "/parallel.bin", &dir, 0, &policy)
+            .await
+            .expect("the segmented transfer completes");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice()
+        );
+
+        let peak = server.peak_active_gets();
+        assert!(
+            peak <= 4,
+            "the per-file worker maximum bounds active ranges, peak was {peak}"
+        );
+        assert!(
+            peak >= 2,
+            "segments must run concurrently (delayed bodies), peak was {peak}"
+        );
+        let rows = sole_rows(&repo);
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_file_below_the_segmentation_threshold_stays_sequential() {
+        let fixture = Fixture::new(123, 1_000);
+        let server = MockServer::start().await;
+        server.mount_route("/small.bin", Behavior::default().with_fixture(fixture));
+        let (scratch, repo) = scratch_repo("segmented-small");
+        let dir = scratch.path().to_owned();
+
+        // The threshold sits above the file: ranges were proven, but the
+        // size gate refuses segmentation.
+        let policy = SegmentationPolicy {
+            min_file_size: 2_000,
+            segment_size: 512,
+            max_segments: 4,
+        };
+        let download = drive_segmented(&repo, &server, "/small.bin", &dir, 0, &policy)
+            .await
+            .expect("the sequential transfer completes");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice()
+        );
+        assert_eq!(
+            ranged_values(&server, "/small.bin"),
+            vec!["bytes=0-0"],
+            "only the probe's evidence range may be requested"
+        );
+        assert_eq!(unranged_gets(&server, "/small.bin"), 1);
+        // A sequential transfer books one whole-range row (the Phase 6
+        // convention); what the size gate refuses is the multi-span plan.
+        let rows = sole_rows(&repo);
+        assert_eq!(rows.len(), 1, "the size gate must not plan spans");
+        assert_eq!((rows[0].min_byte, rows[0].max_byte), (0, 999));
+        assert_eq!(rows[0].state, SegmentState::Completed);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_size_resource_is_never_segmented() {
+        let fixture = Fixture::new(321, 4_096);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/unknown-size.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_head_length_omitted()
+                .with_omit_content_length(true)
+                .with_omit_range_total(true),
+        );
+        let (scratch, repo) = scratch_repo("segmented-unknown");
+        let dir = scratch.path().to_owned();
+
+        // Range support is proven (`bytes 0-0/*`), but no trusted size
+        // exists: the plan gate must refuse segmentation.
+        let policy = small_segments(512, 4);
+        let download = drive_segmented(&repo, &server, "/unknown-size.bin", &dir, 0, &policy)
+            .await
+            .expect("the sequential transfer completes");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice()
+        );
+        assert_eq!(
+            ranged_values(&server, "/unknown-size.bin"),
+            vec!["bytes=0-0"],
+            "no segment range may be requested without a known size"
+        );
+        assert_eq!(unranged_gets(&server, "/unknown-size.bin"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_ranges_after_the_probe_falls_back_sequentially() {
+        let fixture = Fixture::new(456, 8_192);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/range-switch.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_range_switch_after(1, RangeMode::Ignore),
+        );
+        let (scratch, repo) = scratch_repo("segmented-ignore");
+        let dir = scratch.path().to_owned();
+
+        let policy = small_segments(2_048, 4);
+        let download = drive_segmented(&repo, &server, "/range-switch.bin", &dir, 0, &policy)
+            .await
+            .expect("the fallback completes the transfer");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice(),
+            "the sequential fallback is byte-exact"
+        );
+        assert_eq!(
+            transfer_ranges(&server, "/range-switch.bin").len(),
+            4,
+            "the plan was attempted before the switch was detected"
+        );
+        assert_eq!(
+            unranged_gets(&server, "/range-switch.bin"),
+            1,
+            "exactly the fallback GET is unranged"
+        );
+        assert_fallback_ledger(&repo, fixture.len);
+        let record = repo
+            .get_download(repo.list_downloads().expect("list")[0].id)
+            .expect("read back")
+            .expect("present");
+        assert_eq!(record.status, DownloadState::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_content_range_after_the_probe_falls_back_sequentially() {
+        let fixture = Fixture::new(654, 8_192);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/broken-range.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_range_switch_after(1, RangeMode::BrokenHeaders),
+        );
+        let (scratch, repo) = scratch_repo("segmented-broken");
+        let dir = scratch.path().to_owned();
+
+        let policy = small_segments(2_048, 4);
+        let download = drive_segmented(&repo, &server, "/broken-range.bin", &dir, 0, &policy)
+            .await
+            .expect("the fallback completes the transfer");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice(),
+            "a lying Content-Range never becomes file content"
+        );
+        assert_eq!(unranged_gets(&server, "/broken-range.bin"), 1);
+        assert_fallback_ledger(&repo, fixture.len);
+    }
+
+    #[tokio::test]
+    async fn an_overrunning_segment_never_finalizes_a_false_download() {
+        let fixture = Fixture::new(1_000, 8_192);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/overrun.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_overrun_range_by(1_024),
+        );
+        let (scratch, repo) = scratch_repo("segmented-overrun");
+        let dir = scratch.path().to_owned();
+
+        // The first span's body streams 1024 bytes past its Content-Range;
+        // the sibling span (clamped at the fixture's end) cannot overrun.
+        let policy = small_segments(4_096, 4);
+        let err = drive_segmented(&repo, &server, "/overrun.bin", &dir, 0, &policy)
+            .await
+            .expect_err("an overrunning body must fail the transfer");
+        assert_eq!(err.category(), ErrorCategory::RetryExhausted);
+        let (status, category) = failed_record_category(&repo);
+        assert_eq!(status, DownloadState::Failed);
+        assert_eq!(category, Some(ErrorCategory::RetryExhausted));
+        assert!(
+            !dir.join("overrun.bin").exists(),
+            "an overrunning segment never yields a finalized file"
+        );
+        assert!(sole_rows(&repo)
+            .iter()
+            .all(|row| row.state == SegmentState::Failed));
+    }
+
+    #[tokio::test]
+    async fn a_segment_http_error_fails_the_record_without_finalizing() {
+        let fixture = Fixture::new(2_000, 4_096);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/segment-500.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_segment_status(500),
+        );
+        let (scratch, repo) = scratch_repo("segmented-500");
+        let dir = scratch.path().to_owned();
+
+        let policy = small_segments(2_048, 4);
+        let err = drive_segmented(&repo, &server, "/segment-500.bin", &dir, 0, &policy)
+            .await
+            .expect_err("a 500 on every segment must exhaust the budget");
+        assert_eq!(err.category(), ErrorCategory::RetryExhausted);
+        let (status, category) = failed_record_category(&repo);
+        assert_eq!(status, DownloadState::Failed);
+        assert_eq!(category, Some(ErrorCategory::RetryExhausted));
+        assert!(
+            !dir.join("segment-500.bin").exists(),
+            "a segment status error never yields a finalized file"
+        );
+        assert_eq!(
+            unranged_gets(&server, "/segment-500.bin"),
+            0,
+            "the 500 kept the transfer on the segmented path"
+        );
+        assert!(sole_rows(&repo)
+            .iter()
+            .all(|row| row.state == SegmentState::Failed));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_segment_is_retried_within_the_budget_and_never_finalized_early() {
+        let fixture = Fixture::new(3_000, 8_192);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/short-segment.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_truncate_after_probe(1, 100),
+        );
+        let (scratch, repo) = scratch_repo("segmented-truncated");
+        let dir = scratch.path().to_owned();
+
+        // One segment-shaped GET is cut after 100 bytes; the retry attempt
+        // probes again and segments healthily.
+        let policy = small_segments(4_096, 4);
+        let download = drive_segmented(&repo, &server, "/short-segment.bin", &dir, 2, &policy)
+            .await
+            .expect("the retry completes the transfer");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice()
+        );
+        let record = repo
+            .get_download(repo.list_downloads().expect("list")[0].id)
+            .expect("read back")
+            .expect("present");
+        assert_eq!(record.status, DownloadState::Completed);
+        assert_eq!(
+            record.retry_count, 1,
+            "exactly one transient segment failure was counted"
+        );
+        let rows = sole_rows(&repo);
+        let mut completed: Vec<(u64, u64)> = rows
+            .iter()
+            .filter(|row| row.state == SegmentState::Completed)
+            .map(|row| (row.min_byte, row.max_byte))
+            .collect();
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            vec![(0, 4_095), (4_096, 8_191)],
+            "the finishing attempt's spans all complete: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.state != SegmentState::Completed)
+                .all(|row| row.state == SegmentState::Failed && row.received_bytes == 0),
+            "the truncated attempt's spans stay retired history: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_segmented_transfer_parks_it_paused_and_resumable() {
+        let fixture = Fixture::new(4_000, 60_000);
+        let server = MockServer::start().await;
+        server.mount_route(
+            "/segment-shutdown.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_delay_body_ms(20),
+        );
+        let (scratch, repo) = scratch_repo("segmented-shutdown");
+        let dir = scratch.path().to_owned();
+        let repo = Arc::new(repo);
+        let policy = small_segments(16_384, 4);
+        let progress = Progress::shared();
+        let (signal, handle) = ShutdownSignal::channel();
+        let url = server.url("/segment-shutdown.bin");
+
+        let task = {
+            let repo = Arc::clone(&repo);
+            let handle = handle.clone();
+            let client = Arc::new(HttpClient::default_client().expect("client builds"));
+            let progress = Arc::clone(&progress);
+            tokio::spawn(async move {
+                let result = transfer_persisted(
+                    &client,
+                    &repo,
+                    &url,
+                    &dir,
+                    progress,
+                    &RetryPolicy::from_retries(0),
+                    &policy,
+                    test_clock,
+                    &handle,
+                )
+                .await;
+                (result, repo, dir)
+            })
+        };
+
+        // Wait for real segmented progress, then trip the shutdown.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if progress.received() >= 4_096 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the segmented transfer never reported progress"
+            );
+        }
+        signal.trip();
+        let (outcome, repo, dir) = task.await.expect("task joined");
+        let err = outcome.expect_err("shutdown is reported as cancellation");
+        assert_eq!(err.category(), ErrorCategory::Cancelled);
+
+        // The parked state is honest: paused, with per-span confirmed
+        // progress and a partial file that backs it.
+        let record = repo
+            .list_downloads()
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("record exists");
+        assert_eq!(record.status, DownloadState::Paused);
+        let rows = repo.list_segments(record.id).expect("segments listed");
+        assert_eq!(rows.len(), 4, "the plan's rows survive the shutdown");
+        assert!(
+            rows.iter()
+                .any(|row| row.state == SegmentState::Downloading && row.received_bytes > 0),
+            "at least one worker confirmed bytes before stopping: {rows:?}"
+        );
+        let partial = scan_partials(&dir, "segment-shutdown.bin")
+            .expect("dir readable")
+            .into_iter()
+            .next()
+            .expect("the partial survives the shutdown");
+        assert!(std::fs::metadata(&partial.path).expect("measured").len() > 0);
+
+        // A later invocation finishes the transfer byte-exactly. The same
+        // small policy is used: whether recovery re-segments or reconciles a
+        // sequential continuation is Phase 9 territory, but either way the
+        // parked bytes are never trusted blindly.
+        let download = drive_segmented(&repo, &server, "/segment-shutdown.bin", &dir, 0, &policy)
+            .await
+            .expect("the parked transfer completes");
+        assert_eq!(download.bytes_written, fixture.len);
+        assert_eq!(
+            std::fs::read(&download.destination)
+                .expect("final file")
+                .as_slice(),
+            fixture.bytes().as_slice()
+        );
+        let rows = sole_rows(&repo);
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row.state, SegmentState::Completed | SegmentState::Failed)),
+            "a completed record leaves no span mid-flight: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.state == SegmentState::Completed),
+            "the finishing invocation records its completed spans: {rows:?}"
         );
     }
 }

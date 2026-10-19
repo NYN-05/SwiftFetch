@@ -60,6 +60,7 @@ use crate::download::resume::{
     transfer_persisted, unresolved_multiplicity_error, ShutdownHandle, RECOVERABLE,
 };
 use crate::download::retry::RetryPolicy;
+use crate::download::segmented::SegmentationPolicy;
 use crate::download::sequential::select_filename;
 use crate::error::{AppError, ErrorCategory};
 use crate::logging::redact_url;
@@ -153,6 +154,7 @@ pub(crate) async fn run_batch(
     output_dir: &Path,
     max_concurrent_files: u32,
     policy: &RetryPolicy,
+    segmentation: &SegmentationPolicy,
     shutdown: &ShutdownHandle,
     now: fn() -> u64,
 ) -> Result<BatchReport, AppError> {
@@ -188,6 +190,7 @@ pub(crate) async fn run_batch(
         repo: Arc::clone(&repo),
         output_dir: output_dir.to_owned(),
         policy: *policy,
+        segmentation: *segmentation,
         shutdown: shutdown.clone(),
         gauge: Arc::clone(&gauge),
         now,
@@ -260,6 +263,7 @@ struct WorkerContext {
     repo: Arc<Repository>,
     output_dir: PathBuf,
     policy: RetryPolicy,
+    segmentation: SegmentationPolicy,
     shutdown: ShutdownHandle,
     gauge: Arc<ActiveGauge>,
     now: fn() -> u64,
@@ -330,6 +334,7 @@ async fn worker(
                 &context.output_dir,
                 Progress::shared(),
                 &context.policy,
+                &context.segmentation,
                 context.now,
                 &context.shutdown,
             )
@@ -693,7 +698,7 @@ mod tests {
     use crate::common::fixture::Fixture;
     use crate::common::server::{Behavior, MockServer};
     use crate::download::resume::ShutdownSignal;
-    use crate::storage::repository::DownloadRecord;
+    use crate::storage::repository::{DownloadRecord, SegmentState};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
 
@@ -754,6 +759,7 @@ mod tests {
             dir,
             limit,
             &RetryPolicy::from_retries(0),
+            &SegmentationPolicy::default(),
             shutdown,
             test_clock,
         )
@@ -1434,6 +1440,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_global_active_transfer_product_stays_within_file_and_segment_limits() {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new(31, 4_096);
+        let names = ["global-a.bin", "global-b.bin"];
+        for name in names {
+            server.mount_route(
+                &format!("/{name}"),
+                Behavior::default()
+                    .with_fixture(fixture)
+                    .with_delay_body_ms(20),
+            );
+        }
+        let (scratch, repo, _db) = scratch_repo("global-product");
+        let (_signal, handle) = ShutdownSignal::channel();
+        let urls: Vec<String> = names
+            .iter()
+            .map(|name| server.url(&format!("/{name}")))
+            .collect();
+        // Three spans per 4 KiB file (1 500 + 1 500 + 1 096). With the file
+        // limit at two, the global ceiling on concurrently streaming bodies
+        // is the product 2 x 3 — the bound `DOCS/architecture.md` §6
+        // demands of file and segment settings multiplied.
+        let segmentation = SegmentationPolicy {
+            min_file_size: 1,
+            segment_size: 1_500,
+            max_segments: 3,
+        };
+
+        let report = run_batch(
+            HttpClient::default_client().expect("the default client builds"),
+            Arc::clone(&repo),
+            inline(&urls),
+            scratch.path(),
+            2,
+            &RetryPolicy::from_retries(0),
+            &segmentation,
+            &handle,
+            test_clock,
+        )
+        .await
+        .expect("two segmented downloads are one batch");
+
+        assert_eq!(report.completed_count(), 2);
+        assert_eq!(report.peak_active_files, 2, "both file slots ran");
+        let peak_gets = server.peak_active_gets();
+        assert!(
+            peak_gets <= 6,
+            "the file x segment product bounds concurrent bodies, peak was {peak_gets}"
+        );
+        assert!(
+            peak_gets >= 2,
+            "segments of one file must run concurrently, peak was {peak_gets}"
+        );
+        for name in names {
+            assert_eq!(
+                std::fs::read(scratch.path().join(name))
+                    .expect("final file")
+                    .as_slice(),
+                fixture.bytes().as_slice(),
+                "{name} must hold the fixture bytes"
+            );
+        }
+        for url in &urls {
+            let record = records(&repo)
+                .into_iter()
+                .find(|record| &record.url == url)
+                .expect("a record per URL");
+            let rows = repo.list_segments(record.id).expect("segments listed");
+            assert_eq!(rows.len(), 3, "each 4 KiB file plans three spans");
+            assert!(
+                rows.iter().all(|row| row.state == SegmentState::Completed),
+                "every span of a completed segmented file completes: {rows:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_concurrency_limit_of_one_serializes_in_submission_order() {
         let server = MockServer::start().await;
         let names = ["serial-a.bin", "serial-b.bin", "serial-c.bin"];
@@ -1541,6 +1624,7 @@ mod tests {
                     &dir,
                     1,
                     &RetryPolicy::from_retries(0),
+                    &SegmentationPolicy::default(),
                     &handle,
                     test_clock,
                 )
@@ -1656,6 +1740,7 @@ mod tests {
                     &dir,
                     1,
                     &RetryPolicy::from_retries(0),
+                    &SegmentationPolicy::default(),
                     &handle,
                     test_clock,
                 )

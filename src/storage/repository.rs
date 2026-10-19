@@ -24,7 +24,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::types::Type;
@@ -164,8 +164,9 @@ impl DownloadState {
     }
 }
 
-/// State of one segment record. Lifecycle validation arrives with segmented
-/// transfers (Phase 8); Phase 5 stores the state round-trippably.
+/// State of one segment record. Phase 8 adds the tested transition graph
+/// ([`SegmentState::can_transition_to`]); Phase 5 stored the state
+/// round-trippably.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SegmentState {
     Pending,
@@ -183,6 +184,35 @@ impl SegmentState {
             SegmentState::Completed => "completed",
             SegmentState::Failed => "failed",
         }
+    }
+
+    /// Whether one segment state may follow another (Phase 8's graph).
+    ///
+    /// - a pending span is either claimed by a worker or retired;
+    /// - a downloading span advances progress in place, completes, or is
+    ///   retired (a failed sibling / fallback / restart abandons the plan);
+    /// - a completed span is terminal except for retirement as `failed` when
+    ///   a later attempt supersedes the plan (rows are never deleted);
+    /// - a failed span is terminal.
+    ///
+    /// Same-state updates are always permitted: they are progress claims,
+    /// not transitions.
+    pub(crate) const fn can_transition_to(self, to: SegmentState) -> bool {
+        if matches!(
+            (self, to),
+            (Self::Pending, Self::Pending)
+                | (Self::Downloading, Self::Downloading)
+                | (Self::Completed, Self::Completed)
+                | (Self::Failed, Self::Failed)
+        ) {
+            return true;
+        }
+        matches!(
+            (self, to),
+            (Self::Pending, Self::Downloading | Self::Failed)
+                | (Self::Downloading, Self::Completed | Self::Failed)
+                | (Self::Completed, Self::Failed)
+        )
     }
 
     fn parse(text: &str) -> Result<Self, AppError> {
@@ -364,10 +394,15 @@ pub(crate) fn default_database_path() -> Result<PathBuf, AppError> {
 
 /// The metadata repository: one connection to one SQLite file, serialized
 /// behind a mutex so every write is short, ordered, and observable.
-#[derive(Debug)]
+///
+/// Cloning shares the same connection handle (the mutex is behind an `Arc`),
+/// which is what lets Phase 8's spawned segment workers coordinate their
+/// per-segment rows with the transfer engine without opening a second
+/// connection or passing borrowed state into `'static` tasks.
+#[derive(Debug, Clone)]
 pub(crate) struct Repository {
     path: PathBuf,
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Repository {
@@ -410,7 +445,7 @@ impl Repository {
         schema::migrate_connection(&mut conn, schema::MIGRATIONS)?;
         Ok(Self {
             path: path.to_path_buf(),
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
@@ -817,6 +852,11 @@ impl Repository {
     /// Updates a segment's state and its *confirmed* progress: progress may
     /// not exceed the segment's planned byte range (inclusively counting
     /// bytes validated at write time, not merely received from the network).
+    ///
+    /// The transition must follow [`SegmentState::can_transition_to`]; a
+    /// rejected transition writes nothing and reports the current and
+    /// requested states, so a caller can never silently rewrite a finished
+    /// or retired span into another state.
     pub(crate) fn update_segment(
         &self,
         segment_id: i64,
@@ -825,22 +865,35 @@ impl Repository {
     ) -> Result<(), AppError> {
         let received_raw = numeric_value("confirmed segment progress", received)?;
         self.write_transaction("updating a segment record", |transaction| {
-            let range: Option<(u64, u64)> = transaction
+            let row: Option<(u64, u64, String)> = transaction
                 .query_row(
-                    "SELECT min_byte, max_byte FROM segments WHERE id = ?1",
+                    "SELECT min_byte, max_byte, state FROM segments WHERE id = ?1",
                     [segment_id],
                     |row| {
                         let min: i64 = row.get(0)?;
                         let max: i64 = row.get(1)?;
                         let min = nonneg_required(0, "segment start", Ok(min))?;
                         let max = nonneg_required(1, "segment end", Ok(max))?;
-                        Ok((min, max))
+                        Ok((min, max, row.get(2)?))
                     },
                 )
                 .optional()?;
-            let Some((min, max)) = range else {
+            let Some((min, max, current)) = row else {
                 return Err(not_found("segment record", segment_id).into());
             };
+            let current = SegmentState::parse(&current)?;
+            if !current.can_transition_to(to) {
+                return Err(AppError::new(
+                    ErrorCategory::Database,
+                    format!(
+                        "the segment record {segment_id} cannot move from {} to {}; \
+                         the segment lifecycle graph has no such edge",
+                        current.as_str(),
+                        to.as_str()
+                    ),
+                )
+                .into());
+            }
             let span = (max - min) + 1;
             if received > span {
                 return Err(AppError::new(
@@ -1709,6 +1762,8 @@ mod tests {
         assert_eq!(listed[1].min_byte, 1_024);
         assert_eq!(listed[1].max_byte, 4_095);
 
+        repo.update_segment(second, SegmentState::Downloading, 0)
+            .expect("segment claimed");
         repo.update_segment(second, SegmentState::Completed, 3_072)
             .expect("progress confirmed");
         let listed = repo.list_segments(id).expect("segments listed");
@@ -1733,6 +1788,78 @@ mod tests {
             )
             .expect_err("inverted range must fail");
         assert!(err.message().contains("inverted"), "{err}");
+    }
+
+    #[test]
+    fn segment_states_follow_the_phase_8_graph() {
+        use super::SegmentState::{Completed, Downloading, Failed, Pending};
+        let allowed = [
+            (Pending, Pending),
+            (Pending, Downloading),
+            (Pending, Failed),
+            (Downloading, Downloading),
+            (Downloading, Completed),
+            (Downloading, Failed),
+            (Completed, Completed),
+            (Completed, Failed),
+            (Failed, Failed),
+        ];
+        for (from, to) in allowed {
+            assert!(
+                from.can_transition_to(to),
+                "{} must be allowed to follow {}",
+                to.as_str(),
+                from.as_str()
+            );
+        }
+        let refused = [
+            (Pending, Completed),
+            (Downloading, Pending),
+            (Completed, Pending),
+            (Completed, Downloading),
+            (Failed, Pending),
+            (Failed, Downloading),
+            (Failed, Completed),
+        ];
+        for (from, to) in refused {
+            assert!(
+                !from.can_transition_to(to),
+                "{} must not follow {}",
+                to.as_str(),
+                from.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_cannot_skip_its_lifecycle_graph() {
+        let scratch = ScratchDb::new("segment-graph");
+        let repo = scratch.open();
+        let id = insert(&repo, "https://db.test/segment-graph", "graph");
+        let segment = repo
+            .insert_segment(
+                id,
+                NewSegment {
+                    min_byte: 0,
+                    max_byte: 9,
+                    state: SegmentState::Pending,
+                    received_bytes: 0,
+                },
+            )
+            .expect("segment inserted");
+
+        let err = repo
+            .update_segment(segment, SegmentState::Completed, 10)
+            .expect_err("a pending segment cannot complete without downloading");
+        assert_eq!(err.category(), ErrorCategory::Database);
+        assert!(
+            err.message()
+                .contains("cannot move from pending to completed"),
+            "the refusal names the refused edge: {err}"
+        );
+        let stored = repo.list_segments(id).expect("segments listed");
+        assert_eq!(stored[0].state, SegmentState::Pending);
+        assert_eq!(stored[0].received_bytes, 0, "the refusal writes nothing");
     }
 
     #[test]

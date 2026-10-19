@@ -22,6 +22,11 @@
 //! candidates within the Windows per-component length limit as well.
 //! The partial/final naming scheme and the no-overwrite finalization order
 //! are policy, recorded as ADR-0016.
+//!
+//! Phase 8 adds [`PartialFile::open_for_segment`]: segment workers open
+//! *independent* handles on one partial file (never clones of one handle),
+//! each positioned once at the start of its own non-overlapping byte range,
+//! so no two workers ever share a mutable file cursor.
 
 // Phase 4 wiring note: commands call this module from Phase 11; unit tests
 // exercise it in the meantime (narrow `dead_code` waiver per AGENTS.md).
@@ -219,6 +224,54 @@ impl PartialFile {
             )
         })?;
         Ok(Self { path, file })
+    }
+
+    /// Opens an independent write handle on an existing engine-owned
+    /// partial file with its cursor positioned once at `offset` (Phase 8
+    /// segment workers).
+    ///
+    /// Every segment worker opens its *own* handle here: the file position
+    /// of an independently opened handle is private to it (cloning a handle
+    /// would share the cursor instead — never do that for concurrent
+    /// writers), so workers advancing their own cursors can safely write
+    /// disjoint byte ranges of one file at the same time.
+    ///
+    /// The file must already exist — the transfer controller creates or
+    /// truncates it before any worker starts; nothing is created here, and
+    /// nothing is truncated. A file currently shorter than `offset` is
+    /// fine: writing past the end of file extends it (gap bytes belong to
+    /// another worker's range and are filled when that worker writes them),
+    /// so only a missing or unopenable file is an error.
+    pub(crate) async fn open_for_segment(path: &Path, offset: u64) -> Result<Self, AppError> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|err| {
+                fs_failure(
+                    format!(
+                        "the partial file {} could not be opened for a segment worker: {err}",
+                        path.display()
+                    ),
+                    err,
+                )
+            })?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|err| {
+                fs_failure(
+                    format!(
+                        "the partial file {} could not be positioned at segment byte \
+                         {offset} for a segment worker: {err}",
+                        path.display()
+                    ),
+                    err,
+                )
+            })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
     }
 
     /// Writes one body chunk and reports its size, keeping all writes
@@ -648,6 +701,67 @@ mod tests {
                 !dir.path().join("gone.swiftfetch-9-1.part").exists(),
                 "no file may be created by a refused resume"
             );
+        });
+    }
+
+    /// Phase 8: independent segment handles keep their own cursors, so two
+    /// workers can write disjoint byte ranges of one partial file without
+    /// racing — including when the later range is written first (the file
+    /// is extended and the earlier range's gap is filled afterwards).
+    #[test]
+    fn independent_segment_handles_write_disjoint_ranges_of_one_partial() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async move {
+            let dir = ScratchDir::new("segments");
+            let path = dir.path().join("movie.bin.swiftfetch-9-1.part");
+            std::fs::write(&path, b"").expect("empty partial staged");
+
+            let mut low = PartialFile::open_for_segment(&path, 0)
+                .await
+                .expect("low-range handle opens");
+            let mut high = PartialFile::open_for_segment(&path, 4)
+                .await
+                .expect("high-range handle opens");
+
+            // The high range is written first: the file is zero-extended,
+            // and the earlier range is filled by its own handle afterwards.
+            high.write_chunk(b"HHHH").await.expect("high write");
+            assert_eq!(
+                std::fs::metadata(&path).expect("measured").len(),
+                8,
+                "writing past the end of file extends it"
+            );
+            low.write_chunk(b"LLLL").await.expect("low write");
+            high.sync().await.expect("high synced");
+            low.sync().await.expect("low synced");
+
+            assert_eq!(
+                std::fs::read(&path).expect("read"),
+                b"LLLLHHHH",
+                "each handle's write landed at its own range"
+            );
+        });
+    }
+
+    /// A missing partial cannot host a segment worker: nothing is created
+    /// implicitly, so the transfer controller's create-or-truncate step
+    /// stays the only place file state is established.
+    #[test]
+    fn a_segment_handle_refuses_a_missing_partial() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async move {
+            let dir = ScratchDir::new("segment-missing");
+            let path = dir.path().join("gone.swiftfetch-9-1.part");
+            let err = PartialFile::open_for_segment(&path, 0)
+                .await
+                .expect_err("the partial does not exist");
+            assert_eq!(err.category(), ErrorCategory::Filesystem);
+            assert!(
+                err.message().contains("segment worker"),
+                "the message must name the segment-worker open: {}",
+                err.message()
+            );
+            assert!(!path.exists(), "no file may be created by the refused open");
         });
     }
 }

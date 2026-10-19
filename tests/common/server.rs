@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -132,6 +133,31 @@ pub struct Behavior {
     /// [`Behavior::truncate_after`] still applies to every request).
     /// HEAD requests never consume this countdown.
     pub truncate_first: Option<(u64, u64)>,
+    /// Phase 8 range-behavior switch: the first `count` ranged GETs are
+    /// answered with [`Behavior::range`] (the probe's `bytes=0-0` evidence
+    /// request is one of them), then every later range request is answered
+    /// with the replacement mode. This is how a server that proved range
+    /// support during probing is caught changing its behavior for the
+    /// actual segments (ignoring them, lying about `Content-Range`, …).
+    pub range_switch_after: Option<(u64, RangeMode)>,
+    /// Phase 8 segment-drop countdown: the first `count` ranged GETs other
+    /// than the probe's exact `bytes=0-0` evidence request stream only
+    /// `after` bytes and then end; the probe and any sequential fallback
+    /// stay healthy.
+    pub truncate_after_probe: Option<(u64, u64)>,
+    /// Phase 8 segment-status override: ranged GETs other than the probe's
+    /// `bytes=0-0` answer this status with a sentinel body, while the probe
+    /// and unranged requests keep succeeding.
+    pub segment_status: Option<u16>,
+    /// Emit `Content-Range: bytes first-last/*` on honored ranged answers:
+    /// the range works but the total size stays unknown. Combined with
+    /// [`Behavior::omit_content_length`] this is an unknown-size resource
+    /// that still proves range support.
+    pub omit_range_total: bool,
+    /// Stream this many bytes *past* the honored range's end (chunked, so
+    /// the overlong body is legal HTTP): the response body contradicts its
+    /// own `Content-Range` length. Clamped by the fixture's end.
+    pub overrun_range_by: Option<u64>,
 }
 
 impl Default for Behavior {
@@ -153,6 +179,11 @@ impl Default for Behavior {
             content_encoding: None,
             fail_first: None,
             truncate_first: None,
+            range_switch_after: None,
+            truncate_after_probe: None,
+            segment_status: None,
+            omit_range_total: false,
+            overrun_range_by: None,
         }
     }
 }
@@ -262,6 +293,44 @@ impl Behavior {
         self.truncate_first = Some((count, after));
         self
     }
+
+    /// The first `count` ranged GETs keep the configured mode; then the
+    /// replacement mode answers every later range request.
+    #[must_use]
+    pub const fn with_range_switch_after(mut self, count: u64, mode: RangeMode) -> Self {
+        self.range_switch_after = Some((count, mode));
+        self
+    }
+
+    /// First `count` segment-shaped ranged GETs stream only `after` bytes,
+    /// then the route is healthy; the probe evidence request is exempt.
+    #[must_use]
+    pub const fn with_truncate_after_probe(mut self, count: u64, after: u64) -> Self {
+        self.truncate_after_probe = Some((count, after));
+        self
+    }
+
+    /// Answer segment-shaped ranged GETs with this status; the probe and
+    /// unranged GETs keep succeeding.
+    #[must_use]
+    pub const fn with_segment_status(mut self, status: u16) -> Self {
+        self.segment_status = Some(status);
+        self
+    }
+
+    /// Answer honored ranges with an unknown total (`bytes first-last/*`).
+    #[must_use]
+    pub const fn with_omit_range_total(mut self, omit: bool) -> Self {
+        self.omit_range_total = omit;
+        self
+    }
+
+    /// Honored ranges stream `extra` bytes past their end (chunked body).
+    #[must_use]
+    pub const fn with_overrun_range_by(mut self, extra: u64) -> Self {
+        self.overrun_range_by = Some(extra);
+        self
+    }
 }
 
 /// One request as observed by the mock server, in arrival order.
@@ -286,6 +355,33 @@ struct Shared {
     /// Countdown per route (Phase 6 knobs): fail_first keyed by the route
     /// path, truncate_first by `"<path>\0truncate"` so one map holds both.
     failures: Mutex<HashMap<String, u64>>,
+    /// GET responses whose body is currently alive (Phase 8 concurrency
+    /// evidence). A body leaves when it finishes, drops early (truncation),
+    /// or the connection closes.
+    active_gets: AtomicUsize,
+    peak_active_gets: AtomicUsize,
+}
+
+impl Shared {
+    /// Counts one active GET body until the returned guard drops.
+    fn enter_get(self: &Arc<Self>) -> ActiveGetGuard {
+        let active = self.active_gets.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_active_gets.fetch_max(active, Ordering::Relaxed);
+        ActiveGetGuard {
+            shared: Arc::clone(self),
+        }
+    }
+}
+
+/// Decrements the active-GET count when its response body is dropped.
+struct ActiveGetGuard {
+    shared: Arc<Shared>,
+}
+
+impl Drop for ActiveGetGuard {
+    fn drop(&mut self) {
+        self.shared.active_gets.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A mock HTTP server bound to an ephemeral loopback port.
@@ -317,6 +413,8 @@ impl MockServer {
             log: Mutex::new(Vec::new()),
             shutdown: shutdown_tx,
             failures: Mutex::new(HashMap::new()),
+            active_gets: AtomicUsize::new(0),
+            peak_active_gets: AtomicUsize::new(0),
         });
         let shared_for_accept = Arc::clone(&shared);
         let accept = tokio::spawn(async move {
@@ -396,6 +494,13 @@ impl MockServer {
             .get(path)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// High-water mark of simultaneously active GET response bodies across
+    /// the whole server (Phase 8's per-file and global concurrency evidence).
+    #[must_use]
+    pub fn peak_active_gets(&self) -> usize {
+        self.shared.peak_active_gets.load(Ordering::Relaxed)
     }
 
     /// Signals shutdown and waits for the accept loop to release the port.
@@ -588,6 +693,10 @@ struct TestBody {
     advertised_len: Option<u64>,
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     frames_yielded: usize,
+    /// Keeps the server's active-GET gauge incremented while this body is
+    /// alive; `None` for bodies that are not concurrency evidence (HEAD,
+    /// sentinels, redirects).
+    active: Option<ActiveGetGuard>,
 }
 
 impl TestBody {
@@ -610,6 +719,7 @@ impl TestBody {
             advertised_len,
             sleep: None,
             frames_yielded: 0,
+            active: None,
         }
     }
 
@@ -622,6 +732,7 @@ impl TestBody {
             advertised_len: Some(advertised_len),
             sleep: None,
             frames_yielded: 0,
+            active: None,
         }
     }
 
@@ -654,6 +765,12 @@ impl TestBody {
         // any bytes of its own were delivered - which would make every
         // multi-attempt scenario depend on internals rather than the
         // truncation itself.
+        self
+    }
+
+    /// Attaches the active-GET gauge for this body's lifetime.
+    fn with_active(mut self, guard: ActiveGetGuard) -> Self {
+        self.active = Some(guard);
         self
     }
 }
@@ -704,19 +821,23 @@ impl Body for TestBody {
 /// `Content-Length` is requested. 512-byte frames keep frame counts small.
 const STREAM_CHUNK: usize = 512;
 
+/// The exact range the probe uses as its evidence request. Phase 8 knobs
+/// that target *transfer* ranges must exempt this one, or they would break
+/// the very probe that gates segmentation (`src/download/http.rs` sends it).
+const PROBE_EVIDENCE_RANGE: &str = "bytes=0-0";
+
 fn choose_body(
     data: &Arc<Vec<u8>>,
-    advertised_len: u64,
+    advertised_len: Option<u64>,
     behavior: &Behavior,
     truncate_keep: Option<u64>,
 ) -> TestBody {
-    let omit_cl = behavior.omit_content_length;
     let delay = (behavior.delay_body_ms > 0).then(|| Duration::from_millis(behavior.delay_body_ms));
     let mut body = TestBody::stream(
         Bytes::from(data.as_ref().clone()),
         STREAM_CHUNK,
         delay,
-        if omit_cl { None } else { Some(advertised_len) },
+        advertised_len,
     );
     if let Some(keep) = truncate_keep {
         body = body.truncate_after(keep);
@@ -736,6 +857,11 @@ async fn handle(
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| route_key.clone());
     let range_header = req.headers().get(RANGE).cloned();
+    let range_text = range_header
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let is_probe_range = range_text.as_deref() == Some(PROBE_EVIDENCE_RANGE);
 
     let mut captured_headers: BTreeMap<String, String> = BTreeMap::new();
     for (name, value) in req.headers() {
@@ -880,6 +1006,18 @@ async fn handle(
             .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
             .expect("GET status-override response builds"));
     }
+    // Phase 8 segment-status override: only transfer-shaped ranges fail;
+    // the probe evidence request keeps answering so segmentation can start.
+    if let Some(code) = behavior.segment_status {
+        if range_header.is_some() && !is_probe_range {
+            let sentinel = format!("status-{code}");
+            let len = sentinel.len() as u64;
+            return Ok(Response::builder()
+                .status(status_code(code))
+                .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+                .expect("segment status-override response builds"));
+        }
+    }
     // Phase 6 mid-body-drop countdown: only GETs that reach the normal body
     // path consume it, so HEAD probes and status-override routes stay
     // unaffected; after the countdown the truncation must not recur.
@@ -895,50 +1033,101 @@ async fn handle(
                 truncate_keep = Some(after);
             }
         }
-    }
-    let (range_status, content_range, data, advertised): (u16, Option<String>, Arc<Vec<u8>>, u64) =
-        match parse_range(range_header.as_ref(), fixture.len) {
-            RangeParse::Absent | RangeParse::Malformed => (200, None, fixture.bytes(), fixture.len),
-            RangeParse::FullCover => (200, None, fixture.bytes(), fixture.len),
-            RangeParse::Unsatisfiable => {
-                let response = Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header(
-                        CONTENT_RANGE,
-                        HeaderValue::from_str(&format!("bytes */{}", fixture.len))
-                            .expect("valid Content-Range"),
-                    )
-                    .body(TestBody::head_only(0))
-                    .expect("416 response builds");
-                return Ok(response);
+        // Phase 8 segment-drop countdown: the probe's own evidence request
+        // never consumes a slot.
+        if let Some((count, after)) = behavior.truncate_after_probe {
+            if range_header.is_some() && !is_probe_range {
+                let key = format!("{route_key}\u{0}segment-truncate");
+                let mut countdown = shared.failures.lock().expect("failure countdown lock");
+                let served = countdown.entry(key).or_insert(0);
+                if *served < count {
+                    *served += 1;
+                    drop(countdown);
+                    truncate_keep = Some(after);
+                }
             }
-            RangeParse::Normal { start, end } => match behavior.range {
-                RangeMode::Ignore => (200, None, fixture.bytes(), fixture.len),
-                RangeMode::Honor => (
+        }
+    }
+    // Phase 8 range switch: the first `count` ranged GETs (probe included)
+    // are answered by the configured mode; after that the route uses the
+    // replacement mode, whatever it proved before.
+    let mut range_mode = behavior.range;
+    if let Some((limit, replacement)) = behavior.range_switch_after {
+        if range_header.is_some() {
+            let key = format!("{route_key}\u{0}range-honor");
+            let mut countdown = shared.failures.lock().expect("failure countdown lock");
+            let served = countdown.entry(key).or_insert(0);
+            if *served >= limit {
+                range_mode = replacement;
+            } else {
+                *served += 1;
+            }
+        }
+    }
+    let (range_status, content_range, data, advertised): (
+        u16,
+        Option<String>,
+        Arc<Vec<u8>>,
+        Option<u64>,
+    ) = match parse_range(range_header.as_ref(), fixture.len) {
+        RangeParse::Absent | RangeParse::Malformed => {
+            (200, None, fixture.bytes(), Some(fixture.len))
+        }
+        RangeParse::FullCover => (200, None, fixture.bytes(), Some(fixture.len)),
+        RangeParse::Unsatisfiable => {
+            let response = Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(
+                    CONTENT_RANGE,
+                    HeaderValue::from_str(&format!("bytes */{}", fixture.len))
+                        .expect("valid Content-Range"),
+                )
+                .body(TestBody::head_only(0))
+                .expect("416 response builds");
+            return Ok(response);
+        }
+        RangeParse::Normal { start, end } => match range_mode {
+            RangeMode::Ignore => (200, None, fixture.bytes(), Some(fixture.len)),
+            RangeMode::Honor => {
+                let total = if behavior.omit_range_total {
+                    "*".to_owned()
+                } else {
+                    fixture.len.to_string()
+                };
+                // `overrun_range_by` streams bytes past the advertised
+                // Content-Range interval and frames the body chunked (no
+                // Content-Length), so a client can only catch the lie by
+                // comparing bytes received against the range it asked for.
+                let (data, advertised) = match behavior.overrun_range_by {
+                    Some(extra) => (fixture.slice(start, end.saturating_add(extra)), None),
+                    None => (fixture.slice(start, end), Some(end - start + 1)),
+                };
+                (
                     206,
-                    Some(format!("bytes {start}-{end}/{}", fixture.len)),
-                    fixture.slice(start, end),
-                    end - start + 1,
-                ),
-                RangeMode::BrokenHeaders => (
-                    206,
-                    Some(format!(
-                        "bytes {}-{}/{}",
-                        start + 1,
-                        end + 1,
-                        fixture.len + 7
-                    )),
-                    fixture.bytes(),
-                    fixture.len,
-                ),
-                RangeMode::BrokenBody => (
-                    206,
-                    Some(format!("bytes {start}-{end}/{}", fixture.len)),
-                    Fixture::new(fixture.seed + 1, fixture.len).slice(start, end),
-                    end - start + 1,
-                ),
-            },
-        };
+                    Some(format!("bytes {start}-{end}/{total}")),
+                    data,
+                    advertised,
+                )
+            }
+            RangeMode::BrokenHeaders => (
+                206,
+                Some(format!(
+                    "bytes {}-{}/{}",
+                    start + 1,
+                    end + 1,
+                    fixture.len + 7
+                )),
+                fixture.bytes(),
+                Some(fixture.len),
+            ),
+            RangeMode::BrokenBody => (
+                206,
+                Some(format!("bytes {start}-{end}/{}", fixture.len)),
+                Fixture::new(fixture.seed + 1, fixture.len).slice(start, end),
+                Some(end - start + 1),
+            ),
+        },
+    };
 
     let mut response_builder = with_encoding(
         with_validators(
@@ -954,8 +1143,16 @@ async fn handle(
             HeaderValue::from_str(&header).expect("valid Content-Range value"),
         );
     }
+    let advertised_len = if behavior.omit_content_length {
+        None
+    } else {
+        advertised
+    };
     let response = response_builder
-        .body(choose_body(&data, advertised, &behavior, truncate_keep))
+        .body(
+            choose_body(&data, advertised_len, &behavior, truncate_keep)
+                .with_active(shared.enter_get()),
+        )
         .expect("mock response builds");
     Ok(response)
 }

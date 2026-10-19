@@ -1179,5 +1179,157 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0020 | Phase 7 batch layer: acceptance-time queue records, provisional-name refresh, adoption-not-duplication, and the bounded worker pool | Accepted |
 
+## ADR-0021 - Phase 8 segmentation: evidence-gated planning, validated span workers, discard-then-fallback, and the tested segment lifecycle graph
+
+- **Status:** Accepted
+- **Date:** 2026-10-19
+- **Context:** Phase 8 adds parallel byte-range downloads for eligible
+  files while commands remain unwired until Phase 11. The phase's hard
+  constraints: segmentation only when the expected size is known and
+  range support is *validated*; non-overlapping ranges that cover the
+  object exactly once with careful overflow handling; every ranged
+  response validated before any byte is accepted; writes through a
+  safe positioned-write strategy without a shared mutable cursor;
+  bounded per-file and global concurrency (file x segment settings must
+  never multiply into unbounded work); safe fallback when ranges are
+  ignored, malformed, or unsupported; incomplete or corrupt output
+  never finalized; and per-segment state tracking while crash-consistent
+  segment recovery is explicitly deferred to Phase 9
+  (`DOCS/phases.md` Phase 8 step 10). ADR-0018 recorded that segment
+  states exist "for persistence now but have no transition graph until
+  their phases (8 and 10)" - this phase owes that graph.
+- **Decision:**
+  - **Eligibility is evidence-gated.** Segmentation engages only when
+    the probe's facts carry `RangeSupport::Yes` (proven by a validated
+    `206` evidence response), a known expected size, and a plan of at
+    least two spans. A one-span plan is a sequential transfer wearing a
+    costume and is refused. Anything else streams sequentially.
+  - **Plan law.** `preferred = ceil(total / segment_size)`;
+    `span = max(segment_size, ceil(total / max_segments))`; spans are
+    contiguous inclusive ranges from 0 to `total - 1` covering the
+    object exactly once, the remainder lands in the final short span,
+    and a saturating extension keeps arithmetic valid at the `u64` edge.
+    The policy shape is fixed (32 MiB minimum / ~8 MiB nominal / 4
+    maximum - architecture §6 starting values), configurable only
+    through `max_segments_per_file` today.
+  - **Worker law.** One task per planned span (the plan *is* the pool,
+    bounded by the configured maximum), joined through one `JoinSet`;
+    a cancellation `watch` channel is a courtesy signal for siblings
+    after the first failure/fallback; shutdown outranks everything,
+    fallback outranks errors, and the first error is otherwise the
+    pool's outcome. Each worker opens its **own** positioned handle
+    (`PartialFile::open_for_segment`) - never a clone, which would share
+    the cursor - creates no file, writes nothing outside its span, and
+    never seeks mid-transfer.
+  - **Validation law.** Nothing is written until the answer proved:
+    `206`; a parseable `Content-Range` exactly matching the planned
+    interval (and the planned total when stated); a `Content-Length`
+    that reconciles with the interval when stated; and no content
+    transformation. A body that overruns its interval is refused whole
+    (a straddling chunk must not partially land) after syncing the
+    confirmed prefix; a body that ends early is a retryable failure;
+    both are typed `RangeValidation` errors with the transport marker,
+    so the Phase 6/7 retry machinery classifies them as transient.
+  - **Ledger law (the ADR-0018 deferral, discharged).** The segment
+    transition graph, enforced in `update_segment` inside its write
+    transaction: `pending → downloading | failed`;
+    `downloading → completed | failed`; `completed → failed`
+    (retirement when a later attempt supersedes the plan); `failed`
+    is terminal; same-state updates are progress claims and always
+    allowed. A refused edge writes nothing and names both states.
+    Rows are history: retirement zeroes the claim but never deletes
+    the row. After any completed invocation, no row of the record may
+    be left `pending`/`downloading`.
+  - **Completion law.** The rename runs only after every planned
+    worker recorded `Completed` **and** a final on-disk length check
+    against the validated total passes; a short file is discarded as a
+    retryable length violation, never finalized.
+  - **Fallback law.** Ignored (200), unsatisfiable (416),
+    malformed/mismatched `Content-Range`, changed totals, and
+    contradicting lengths abort the plan: the rows are retired
+    `Failed`, the partial is truncated to zero, and the *same attempt*
+    continues with a clean sequential fetch - the byte stream after a
+    fallback is one sequential, validated transfer from byte 0, never
+    an append onto ambiguous span output.
+  - **Shutdown law.** Workers sync and record confirmed progress at
+    their boundary; the record parks `paused` with its plan rows and
+    partial intact (the ADR-0019 parking shape). Recovery on a later
+    invocation is deliberately conservative (Phase 6/7 reconciliation
+    rules); reusing confirmed spans is Phase 9's work.
+  - **Bounds law.** Workers per file ≤ configured maximum; the batch
+    layer's file pool times the per-file maximum bounds the global
+    concurrent-body product, observed through the mock's active-GET
+    gauge (not asserted by construction alone).
+  - **Engine contract change.** `transfer_persisted` gains a ninth
+    parameter, `&SegmentationPolicy` (before `now`), and `run_batch`
+    threads the same policy into every engine call; this supersedes the
+    exact signature recorded in ADR-0020's consequences while keeping
+    its shape. `Repository` becomes `Clone` by moving its connection
+    mutex behind an `Arc`, so spawned workers share the one serialized
+    connection - no second connection, every write still one short
+    transaction.
+- **Alternatives considered:**
+  1. **Segment on weaker evidence** (HEAD only, unknown size,
+     `RangeSupport::Unknown`) - rejected: the phase requires a known
+     size and *validated* range support; guessing risks writing
+     misaligned bytes.
+  2. **Preallocate the whole file up front** - rejected: allocates
+     disk for data never transferred and, worse, makes "file length ==
+     expected" meaningless as a finalization check (a preallocated file
+     cannot distinguish written from missing spans). Plain writes that
+     extend the file keep length meaningful.
+  3. **One shared file handle with seeks, or per-chunk positioned
+     writes through a locked handle** - rejected: a shared cursor is a
+     race by definition, and serializing writes through one lock would
+     throw away the parallelism on Windows file handles; independent
+     positioned handles are the platform-correct mechanism, already the
+     writer's shape.
+  4. **Reuse confirmed spans of an interrupted plan on the next
+     invocation** - rejected for this phase: crash-consistent recovery
+     is explicitly Phase 9's (step 10); conservative discard/reconcile
+     is the trust-safe placeholder.
+  5. **Retry a single failed span in place** - rejected: the engine's
+     retry unit is the whole attempt (ADR-0019); per-span retry needs
+     the recovery semantics Phase 9 defines, and re-planning the whole
+     file is cheap next to fault tolerance complexity.
+  6. **Fall back by appending from the last confirmed byte** -
+     rejected: the partial after an aborted plan is not a contiguous
+     validated prefix (sibling spans may have landed anywhere), so the
+     only honest fallback is truncate-to-zero then one sequential
+     stream.
+  7. **One task per segment without a plan bound** - rejected: the
+     plan is the bound; a task-per-segment scheme over an unbounded
+     range count would reintroduce the unbounded-work failure ADR-0020
+     rejected for URLs.
+- **Consequences:**
+  - `segmented.rs` is the engine's second transfer strategy;
+    `full_transfer` selects it from probe facts before wasting a
+    full-body GET, and a response already in hand always streams
+    sequentially (its bytes are fresh content).
+  - The batch and the engine share one `SegmentationPolicy` value from
+    the caller down; Phase 11 maps `--segments` through `from_config`.
+  - The ledger keeps honest history: a completed record can show
+    `Completed` spans beside `Failed` retired predecessors; no row ever
+    hovers mid-flight after an invocation completes.
+  - Test infrastructure grew reusable range-hostility knobs
+    (`range_switch_after`, `truncate_after_probe`, `segment_status`,
+    `omit_range_total`, `overrun_range_by`) and a streaming-body
+    concurrency gauge - Phase 9's recovery tests can build on both.
+  - `Repository: Clone` is now part of the storage surface; its clones
+    are the same connection, which callers must treat as a shared
+    serialized resource.
+- **Related:** ADR-0016 (naming/finalization), ADR-0018 (segment-graph
+  deferral discharged here), ADR-0019 (retry classification, shutdown
+  parking, reconciliation rules reused), ADR-0020 (batch signature
+  extended), `DOCS/phases.md` Phase 8 (Phase 9 boundary),
+  `changes.md` Phase 8 entry.
+
+### Addendum-index extension (ADR-0021 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0021 | Phase 8 segmentation: evidence-gated planning, validated span workers, discard-then-fallback, and the tested segment lifecycle graph | Accepted |
+
+
 
 

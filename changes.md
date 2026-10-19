@@ -1282,6 +1282,213 @@ storage 37 (file_writer 9, repository 20, schema 8). Phase 6 baseline
     and the fresh-clone gate results land in the post-commit addendum
     below - the same rule as Phases 1-6.
 
+## Phase 8 - Segmented Downloads
+
+- **Date:** 2026-10-19
+- **Version:** `0.9.0` → `0.10.0`
+- **Outcome:** Phase 8 exit gate met (working tree). A new module
+  (`src/download/segmented.rs`) plans and runs parallel byte-range
+  transfers while preserving every existing law. Segmentation engages
+  only when the probe *proved* byte-range support (`RangeSupport::Yes`)
+  and the expected size is known: the plan covers `[0, total-1]` exactly
+  once with contiguous, non-overlapping inclusive spans, never more than
+  the configured per-file maximum (default 4), with the 32 MiB minimum
+  size and ~8 MiB nominal span from `DOCS/architecture.md` §6
+  (`from_config` maps `max_segments_per_file`; planner arithmetic is
+  overflow-safe and the non-divisible tail lands in a final short span).
+  Each span runs as one worker task (the plan *is* the pool - no task per
+  URL-style unbounded spawning) and every ranged answer is validated
+  before a single byte is written: `206` with an exact, matching
+  `Content-Range` (the planned interval, and the planned total when
+  stated), a reconciling `Content-Length` when stated, and no content
+  transformation. Workers write through independent positioned handles
+  (`PartialFile::open_for_segment` - never a shared mutable cursor), keep
+  every write inside their own span, and refuse overrun chunks and
+  premature ends as retryable length violations. Ignored, malformed, or
+  contradictory range behavior (a `200`, a `416`, an unparseable or
+  mismatched `Content-Range`, a changed total, a contradicting length)
+  aborts the whole plan safely: its rows are retired `Failed`, its
+  partial is truncated to zero, and the same attempt continues with a
+  clean sequential fetch. A worker error follows the same discard order
+  and then rides the existing retry machinery; shutdown parks the record
+  `paused` with confirmed per-span rows and the partial preserved.
+  Finalization happens only after every planned span is recorded
+  `Completed` **and** a final check confirms the file on disk really
+  holds the expected total. The CLI is untouched and still honestly
+  not-implemented; Phase 11 wires it. Per the phase's step 10,
+  crash-consistent segment recovery is Phase 9's work: this phase tracks
+  per-segment state, and a later invocation reconciles conservatively
+  under the existing Phase 6/7 rules rather than reusing partial spans.
+- **Dependency and feature changes:** none. No new crates; the existing
+  tokio product feature set (`fs`, `io-util`, `time`, `sync`, `macros`,
+  `rt`) already covers the phase's `JoinSet` worker pool, `watch`
+  cancellation signal, and file IO. The Phase 6 feature-unification trap
+  was re-checked explicitly: plain `cargo build` (no dev-dependency
+  unification) is green.
+- **Code changes**
+
+| File | Change |
+|---|---|
+| `src/download/segmented.rs` (new, 854 lines) | The Phase 8 module: `SegmentationPolicy` (minimum size / nominal segment size / per-file maximum, architecture §6 defaults, `from_config` mapping), evidence-gated `plan_for_probe` (`RangeSupport::Yes` + known size + ≥2 spans), exact-cover overflow-safe `plan`, `SegmentSpan` (`len`, `range_header`), `SegmentContext`, `download_segments` worker pool (one `JoinSet` task per planned span, `watch`-channel cancellation courtesy signal, fallback outranks errors except shutdown, which outranks both), the per-worker validation/write loop (independent positioned handle, 1 MiB progress confirmations, overrun and premature-end refusals), typed overrun/premature-end errors classified retryable. 12 planner tests. |
+| `src/download/resume.rs` | Engine wiring: `Attempt` carries `segmentation: &SegmentationPolicy` and an `Arc<Progress>`; `transfer_persisted` gains the 9th parameter (documented engine contract); `full_transfer` plans a segmented transfer from the probe's proven facts *before* any full-body GET when no response is in hand (a response in hand - a legal `200` answering a ranged restart - is always streamed sequentially, its bytes are fresh content); `SegmentedOutcome {Completed, Interrupted, Fallback}`; `segmented_transfer` inserts the plan's rows `Pending`, runs the pool, and on completion enforces the on-disk length check before `finalize_claimed`; `retire_segments`/`discard_segments` implement the retire-then-truncate discard; `ensure_segment` now retires *every* superseded non-`Failed` row (not just `min_byte = 0` ones), so a sequential pass can never leave a segmented sibling row stuck `Downloading`. 11 new engine tests; all existing call sites threaded the policy. |
+| `src/app/batch.rs` | `run_batch`/`WorkerContext` thread the segmentation policy into every engine call (the batch is the engine's production driver). 1 new test: the global active-transfer product (two files × three spans against the active-GET gauge: peak ≤ 6, both file slots observed busy, byte-exact files, 3 completed span rows each). |
+| `src/storage/repository.rs` | `Repository` is now `Clone` (the connection mutex lives behind an `Arc`), so spawned segment workers share the one serialized connection instead of opening a second; `SegmentState::can_transition_to` implements the Phase 8 lifecycle graph ADR-0018 deferred (`pending → downloading | failed`, `downloading → completed | failed`, `completed → failed` retirement, `failed` terminal, same-state updates allowed as progress claims), and `update_segment` validates it inside the write transaction (a refused edge writes nothing). 2 new tests; 1 existing round-trip test updated to walk `Pending → Downloading → Completed`. |
+| `src/storage/file_writer.rs` | `PartialFile::open_for_segment(path, offset)`: an independent write handle positioned once at a span start (never a clone - cloned handles share the cursor); the file must already exist (the transfer controller creates or truncates it), and writing past EOF extends it (gap bytes belong to another worker). 2 new tests (disjoint-range writes including high-range-first extension; a missing partial is refused without creating anything). |
+| `src/download/mod.rs` | Declares `pub mod segmented;`; module-doc paragraph updated. |
+| `tests/common/server.rs` | Mock knobs for Phase 8 scenarios: `range_switch_after` (the first N ranged GETs answered by the configured mode, later ones by a replacement mode - the probe counts), `truncate_after_probe` (transfer-shaped ranges only), `segment_status` (HTTP status for transfer-shaped ranges), `omit_range_total` (`bytes X-Y/*`), `overrun_range_by` (a body streaming past its Content-Range, chunk-framed with no Content-Length), the `PROBE_EVIDENCE_RANGE` (`bytes=0-0`) exemption that keeps the probe itself working, and the streaming-body gauge (`MockServer::peak_active_gets()` via `ActiveGetGuard`/`TestBody::with_active`) as concurrency evidence. `choose_body` now takes the advertised Content-Length as `Option<u64>` end to end. 6 new mock tests (30 total). |
+| `tests/mock_server.rs` | The 6 new mock-behavior tests above lock each knob's exact wire behavior (bodies, headers, exemptions, gauge overlap). |
+| `Cargo.toml` / `Cargo.lock` | version `0.10.0` (lock: version line only). |
+| `decision.md` | ADR-0021 + its addendum-index row. |
+
+- **Defects caught before commit (recorded honestly)**
+  1. The first full engine-test run failed five of the new Phase 8 tests
+     on wrong *ledger expectations* the tests themselves had encoded, not
+     on engine behavior: a sequential transfer books one whole-range row
+     (the Phase 6 convention - the below-threshold test wrongly demanded
+     zero rows); a fallback ends with the aborted plan's four spans
+     retired `Failed` **plus** the sequential continuation's completed
+     whole-range row (both fallback tests had not counted the second
+     row); a retried attempt's predecessor rows remain as `Failed`
+     history beside the finishing plan's `Completed` rows; and the
+     paused-resume test initially resumed under the default policy
+     instead of the test-scale one. The assertions were corrected to the
+     actual honest ledgers (with a shared `assert_fallback_ledger`
+     helper) - no engine semantics were bent to fit tests.
+  2. Reasoning through that paused-resume ledger exposed a real gap:
+     `ensure_segment` retired only `min_byte = 0` rows, so a sequential
+     continuation after a paused segmented transfer could leave sibling
+     span rows `Downloading` forever on a soon-completed record. Every
+     superseded non-`Failed` row is now retired inside the same
+     transaction discipline, and the shutdown test asserts that a
+     completed record leaves no span mid-flight.
+  3. The `overrun_range_by` mock knob first threaded an `Option<u64>`
+     advertised length into a `u64` slot (a compile error caught by
+     `cargo check -all-targets` before any test ran); `choose_body` now
+     takes `Option<u64>` end to end, which is exactly the chunked-overrun
+     semantics the knob needs.
+  4. Mechanical lint repair: one clippy `redundant_locals` in the new
+     shutdown test.
+- **Behavior contract (Phase 8)**
+  - **Eligibility law.** Segmentation requires *proven* range support
+    (the probe's validated `206` evidence), a known expected size, at
+    least two planned spans, and the configured minimum size; every
+    other transfer streams sequentially. A one-span "plan" is never
+    segmentation.
+  - **Plan law.** Spans are contiguous, non-overlapping inclusive
+    ranges, start at 0, end at `total - 1`, cover the object exactly
+    once, and number at most the configured maximum; arithmetic is
+    overflow-safe at the `u64` edge and the non-divisible remainder
+    lands in the final short span.
+  - **Validation law.** A worker writes nothing until the answer proved
+    `206` with an exact, parseable `Content-Range` for its planned
+    interval (agreeing with the planned total when stated), a
+    reconciling `Content-Length` when stated, and no content
+    transformation. A body that overruns its interval is refused whole
+    (a straddling chunk must not partially land); a body that ends early
+    is a retryable failure; neither ever becomes a completed file.
+  - **Write law.** Each worker owns one independent file handle
+    positioned at its span start; no two workers ever share a mutable
+    cursor; writes never leave the span; confirmed progress is synced
+    and recorded at 1 MiB intervals and at every worker boundary.
+  - **Fallback law.** Ignored (200), unsatisfiable (416),
+    malformed/mismatched `Content-Range`, changed totals, or
+    contradicting lengths abort the plan: rows are retired `Failed`, the
+    partial is truncated to zero, and the same attempt re-fetches the
+    resource sequentially (byte-exact). Discard is best-effort-logged
+    for its cleanup half and never masks the cause.
+  - **Completion law.** The rename happens only after every planned
+    worker recorded `Completed` **and** the file on disk is exactly the
+    expected total; a failure after that point follows the existing
+    finalization-failure rules. A segment failure can never finalize a
+    false download.
+  - **Shutdown law.** A tripped shutdown makes each worker sync and
+    persist its confirmed progress; the record parks `paused` with its
+    plan rows and partial intact (ADR-0019's parking shape); a later
+    invocation reconciles conservatively (Phase 6/7 rules - Phase 9 owns
+    crash-consistent span reuse).
+  - **Bounds law.** Workers per file = planned spans ≤ configured
+    maximum; the batch layer's file pool times the per-file segment
+    maximum bounds the global concurrent-body product - observed, not
+    asserted by construction alone (`peak_active_gets ≤ 6` for two files
+    × three spans, with the per-file peak ≤ 4 in the engine test).
+  - **Ledger law.** Plan rows move `Pending → Downloading → Completed`
+    (the ADR-0018-deferred graph, now enforced in `update_segment`);
+    superseding plans retire rows `Failed` with zeroed claims (rows are
+    never deleted); after any completed invocation no row of the record
+    is left mid-flight.
+  - **CLI law.** Unchanged: commands still print the honest
+    not-implemented error and exit 1; the segmented engine has no
+    production caller until Phase 11 and carries the sanctioned narrow
+    `#[allow(dead_code)]` waiver naming that phase.
+- **Verification - actual results (all run on Windows)**
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings |
+| `cargo test` | **289 passed, 0 failed** = 233 unit + 11 cli + 15 fixtures + 30 mock_server (unit run 219.2 s; cli 2.8 s; fixtures 0.0 s; mock_server 2.1 s) |
+| `cargo build` (extra, plain product build) | pass - no feature-unification dependency remains |
+
+Observed per-module unit counts (`--list`): app 27 (3 dispatch + 24
+batch), cli 9, common::fixture 6, config 7, download 133 (http 5, probe
+37, progress 2, resume 41, retry 11, segmented 12, sequential 25), error
+5, logging 5, storage 41 (file_writer 11, repository 22, schema 8).
+Phase 7 baseline 205 → 233 unit tests (+28: 12 planner + 11 engine + 2
+file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
+
+- The CLI behavior contract is untouched and still locked by its Phase 1
+  tests (11 passed).
+- The ADR-0014 double-count disclosure still applies: the six common
+  fixture inline tests run in multiple targets.
+- Disclosed limitations, honest for this phase: crash-consistent segment
+  recovery (reusing already-completed spans after a process or system
+  interruption) is deliberately *not* implemented - `DOCS/phases.md`
+  Phase 8 step 10 defers it to Phase 9, and this phase's pause/resume
+  path proves only conservative reconciliation; segment workers are one
+  task per planned span bounded by the configured maximum (bounded, and
+  the architecture's "global transfer limit caps file x segment
+  concurrency" is satisfied through the batch's file pool - the product
+  test observes ≤ 6 concurrent streaming bodies, not an RSS ceiling);
+  the architecture sketch's `tests/segmented_download.rs` target was not
+  created: the segmented engine has no production caller until Phase 11,
+  so engine-level integration tests need the inline `pub(crate)` access
+  of `src/download/resume.rs` (mock-level wire behavior lives in
+  `tests/mock_server.rs`); the mock's gauge counts every streaming body
+  including brief probe/HEAD bodies, so the engine-level per-file peak
+  assertion uses the gauge with delayed segment bodies as evidence; the
+  Phase 6 mock disclosures (truncation = clean mid-body EOF that poisons
+  the pooled connection for the next request; the probe's evidence GET
+  consumes a `range_switch_after`/`truncate_after_probe` slot) still
+  stand and are now relied on by the Phase 8 scenarios.
+- Windows honesty: every check ran on Windows (MSVC, rustc 1.99.1),
+  including the positioned-write/disjoint-range file-writer tests and
+  the concurrent-handle extension case; nothing in Phase 8 ran on
+  another platform.
+- **Pre-existing tracking gap (disclosed, not silently fixed):** when
+  this entry was appended, `changes.md` ended at the Phase 7 entry whose
+  scope notes promise a post-commit verification addendum; no such
+  addendum exists after `1832ec3` (the two commits that follow it touch
+  only `AGENTS.md`). Nothing here rewrites that history - the Phase 8
+  addendum below records only its own hash and fresh-clone results.
+- **Scope-control notes**
+  - No extraction, no pause/resume command wiring, no GUI, no telemetry
+    - their phases per `DOCS/phases.md`; Phase 9 (crash consistency and
+    segmented recovery) is not started.
+  - No new crates and no feature changes (checked above); the single
+    shared `reqwest::Client` still comes from `HttpClient`, and no
+    compression features exist anywhere (a transparent transform would
+    invalidate byte-range offsets - the reason `reqwest` carries
+    `default-features = false` since Phase 3).
+  - The `Repository: Clone` change (one shared, serialized connection
+    behind an `Arc`) is the only structural change to an earlier layer;
+    it opens no second connection and every write remains one short
+    transaction.
+  - Tracking files: both appends observe ADR-0010 (append-only at the
+    very bottom). The phase commit cannot know its own hash, so the hash
+    and the fresh-clone gate results land in the post-commit addendum
+    below.
+
+
 
 
 
