@@ -3802,7 +3802,7 @@ mod tests {
             Some(fixture.len),
         );
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "resume-404.bin", &*fixture.slice(0, 511));
+        stage_partial(&dir, "resume-404.bin", &fixture.slice(0, 511));
 
         let err = drive(&repo, &server, "/resume-404.bin", &dir, 5)
             .await
