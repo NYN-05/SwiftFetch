@@ -465,6 +465,10 @@ async fn run_attempt(ctx: &Attempt<'_>, plan: RecoveryPlan) -> Result<AttemptOut
             ctx.repo
                 .update_transfer_facts(record.id, &probe_facts(&facts), (ctx.now)())?;
             let redacted = redact_url(&facts.effective_url);
+            // If the record has segmented rows (from a previous segmented attempt),
+            // force sequential to avoid re-segmenting a restarted transfer.
+            let rows = ctx.repo.list_segments(record.id)?;
+            let force_sequential = rows.len() > 1 || rows.iter().any(|r| r.min_byte > 0);
             full_transfer(
                 ctx,
                 record.id,
@@ -474,7 +478,7 @@ async fn run_attempt(ctx: &Attempt<'_>, plan: RecoveryPlan) -> Result<AttemptOut
                 &facts,
                 partial,
                 None,
-                false,
+                force_sequential,
             )
             .await
         }
@@ -1089,7 +1093,8 @@ fn reconcile_segmented_download(
                     row.max_byte,
                     file_len
                 );
-                segments_to_fetch.push(row.clone());
+                // Don't add the original Completed row to fetch list; we'll handle
+                // it in the later loop by retiring and inserting a fresh Pending row.
             }
             SegmentState::Downloading => {
                 // Interrupted mid-stream. The received_bytes may be
@@ -1102,7 +1107,24 @@ fn reconcile_segmented_download(
             }
             SegmentState::Failed => {
                 // Retired from a previous attempt (e.g., fallback).
-                segments_to_fetch.push(row.clone());
+                // Insert a fresh Pending row for the re-fetch (Failed is terminal).
+                let new_id = repo.insert_segment(
+                    record.id,
+                    NewSegment {
+                        min_byte: row.min_byte,
+                        max_byte: row.max_byte,
+                        state: SegmentState::Pending,
+                        received_bytes: 0,
+                    },
+                )?;
+                segments_to_fetch.push(SegmentRecord {
+                    id: new_id,
+                    download_id: row.download_id,
+                    min_byte: row.min_byte,
+                    max_byte: row.max_byte,
+                    state: SegmentState::Pending,
+                    received_bytes: 0,
+                });
             }
         }
     }
@@ -1184,10 +1206,13 @@ fn reconcile_segmented_download(
     // Sort segments to fetch by min_byte for sequential processing.
     segments_to_fetch.sort_by_key(|s| s.min_byte);
 
-    // Deconfirm Downloading/Pending/Failed segments by resetting their
-    // received_bytes to 0 (they'll be re-fetched from their start).
+    // For Downloading/Pending segments, reset received_bytes to 0.
+    // For Failed segments, we already inserted new Pending rows above,
+    // so they're not in this list anymore.
     for seg in &segments_to_fetch {
-        let _ = repo.update_segment(seg.id, SegmentState::Pending, 0);
+        if seg.state != SegmentState::Failed {
+            let _ = repo.update_segment(seg.id, SegmentState::Pending, 0);
+        }
     }
 
     Ok(RecoveryPlan::SegmentedResume {
@@ -1835,6 +1860,7 @@ async fn resume_attempt(
                 &facts,
                 Some(partial),
                 None,
+                true,
             )
             .await;
         }
@@ -1881,6 +1907,7 @@ async fn resume_attempt(
                     &facts,
                     Some(partial),
                     None,
+                    true,
                 )
                 .await;
             }
@@ -5337,8 +5364,14 @@ mod tests {
                 test_clock(),
             )
             .expect("download inserted");
+        repo.update_status(id, DownloadState::Probing, test_clock(), None)
+            .expect("walk to probing");
+        repo.update_status(id, DownloadState::Downloading, test_clock(), None)
+            .expect("walk to downloading");
+        repo.update_status(id, DownloadState::Finalizing, test_clock(), None)
+            .expect("walk to finalizing");
         repo.update_status(id, DownloadState::Completed, test_clock(), None)
-            .expect("status updated");
+            .expect("walk to completed");
         repo.update_transfer_facts(
             id,
             &TransferFacts {
@@ -5481,3 +5514,9 @@ mod tests {
         Ok(format!("{:x}", hasher.finalize()))
     }
 }
+
+
+
+
+
+
