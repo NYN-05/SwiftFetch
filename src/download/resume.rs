@@ -3612,7 +3612,7 @@ mod tests {
             Some(fixture.len),
         );
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "broken-headers.bin", &*fixture.slice(0, 511));
+        stage_partial(&dir, "broken-headers.bin", &fixture.slice(0, 511));
 
         server.mount_route(
             "/broken-headers.bin",
