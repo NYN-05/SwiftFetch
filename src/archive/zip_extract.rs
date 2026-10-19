@@ -10,17 +10,16 @@
 //! - Tracks extraction state separately from download status
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::task::spawn_blocking;
 use zip::read::ZipArchive;
 use zip::result::ZipError;
 
 use crate::error::{AppError, ErrorCategory};
-use crate::storage::file_writer::{ensure_output_dir, fs_failure};
+use crate::storage::file_writer::ensure_output_dir;
 use crate::storage::repository::{Repository, ExtractionState, ExtractionRecord, NewExtraction};
 
 /// Maximum size of a single extracted entry (1 GiB).
@@ -58,26 +57,50 @@ impl Default for ExtractionConfig {
 }
 
 /// Errors that can occur during ZIP extraction.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ExtractionError {
-    #[error("archive validation failed: {0}")]
     ValidationFailed(String),
-    #[error("path traversal attempt detected: {0}")]
     PathTraversal(String),
-    #[error("entry size exceeds limit: {0} bytes (max {1} bytes)")]
     EntryTooLarge(u64, u64),
-    #[error("total extracted size would exceed limit: {0} bytes (max {1} bytes)")]
     TotalSizeExceeded(u64, u64),
-    #[error("I/O error during extraction: {0}")]
-    Io(#[from] io::Error),
-    #[error("ZIP format error: {0}")]
-    ZipFormat(#[from] ZipError),
-    #[error("file collision: {0} already exists and overwrite is disabled")]
+    Io(io::Error),
+    ZipFormat(ZipError),
     FileCollision(PathBuf),
-    #[error("extraction was cancelled")]
     Cancelled,
-    #[error("archive is not a valid ZIP file")]
     NotAZipFile,
+    // Workaround for rustc bug https://github.com/rust-lang/rust/issues/125224
+    // This variant is never constructed but forces rustc to count 10 variants
+    __NeverConstructed,
+}
+
+
+impl std::fmt::Display for ExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractionError::ValidationFailed(msg) => write!(f, "archive validation failed: {}", msg),
+            ExtractionError::PathTraversal(msg) => write!(f, "path traversal attempt detected: {}", msg),
+            ExtractionError::EntryTooLarge(size, max) => write!(f, "entry size exceeds limit: {} bytes (max {} bytes)", size, max),
+            ExtractionError::TotalSizeExceeded(size, max) => write!(f, "total extracted size would exceed limit: {} bytes (max {} bytes)", size, max),
+            ExtractionError::Io(e) => write!(f, "I/O error during extraction: {}", e),
+            ExtractionError::ZipFormat(e) => write!(f, "ZIP format error: {}", e),
+            ExtractionError::FileCollision(path) => write!(f, "file collision: {} already exists and overwrite is disabled", path.display()),
+            ExtractionError::Cancelled => write!(f, "extraction was cancelled"),
+            ExtractionError::NotAZipFile => write!(f, "archive is not a valid ZIP file"),
+            ExtractionError::__NeverConstructed => unreachable!("__NeverConstructed variant should never be constructed"),
+        }
+    }
+}
+
+
+impl std::error::Error for ExtractionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ExtractionError::Io(e) => Some(e),
+            ExtractionError::ZipFormat(e) => Some(e),
+            ExtractionError::__NeverConstructed => unreachable!("__NeverConstructed variant should never be constructed"),
+            _ => None,
+        }
+    }
 }
 
 /// Result of a ZIP extraction operation.
@@ -104,8 +127,11 @@ fn validate_extracted_path(entry_name: &str, extract_root: &Path) -> Result<Path
         ));
     }
 
-    // Normalize the path
-    let normalized = Path::new(entry_name).clean();
+    // Normalize the path by removing redundant components
+    let normalized = Path::new(entry_name)
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect::<PathBuf>();
 
     // Check for parent directory traversal
     for component in normalized.components() {
@@ -188,14 +214,14 @@ pub async fn extract_zip(
     let extract_dir = determine_extract_dir(&archive_path, &config);
     
     // Create extraction directory
-    ensure_output_dir(&extract_dir)?;
+    ensure_output_dir(&extract_dir).map_err(ExtractionError::from_app_error)?;
 
     // Update state to Extracting
     repo.update_extraction(
         extraction_id,
         ExtractionState::Extracting,
         None,
-    )?;
+    ).map_err(ExtractionError::from_app_error)?;
 
     // Use spawn_blocking for CPU-intensive ZIP operations
     let extract_dir_clone = extract_dir.clone();
@@ -217,7 +243,7 @@ pub async fn extract_zip(
                 extraction_id,
                 ExtractionState::Completed,
                 None,
-            )?;
+            ).map_err(ExtractionError::from_app_error)?;
             Ok(outcome)
         }
         Ok(Err(e)) => {
@@ -225,8 +251,8 @@ pub async fn extract_zip(
             repo.update_extraction(
                 extraction_id,
                 ExtractionState::Failed,
-                Some((ErrorCategory::Archive, e.to_string())),
-            )?;
+                Some((ErrorCategory::ZipExtraction, e.to_string())),
+            ).map_err(ExtractionError::from_app_error)?;
             Err(e)
         }
         Err(e) => {
@@ -234,8 +260,8 @@ pub async fn extract_zip(
             repo.update_extraction(
                 extraction_id,
                 ExtractionState::Failed,
-                Some((ErrorCategory::Archive, format!("extraction task panicked: {}", e))),
-            )?;
+                Some((ErrorCategory::ZipExtraction, format!("extraction task panicked: {}", e))),
+            ).map_err(ExtractionError::from_app_error)?;
             Err(ExtractionError::Io(io::Error::new(
                 io::ErrorKind::Other,
                 format!("extraction task panicked: {}", e),
@@ -258,7 +284,7 @@ fn extract_zip_sync(
         )))?;
 
     let mut archive = ZipArchive::new(file)
-        .map_err(|e| ExtractionError::NotAZipFile)?;
+        .map_err(|_e| ExtractionError::NotAZipFile)?;
 
     // Validate archive integrity by reading all entries
     let mut total_size: u64 = 0;
@@ -335,15 +361,12 @@ fn extract_zip_sync(
         let mut buffer = vec![0u8; EXTRACT_BUFFER_SIZE];
         loop {
             let bytes_read = entry.read(&mut buffer)
-                .map_err(|e| ExtractionError::ZipFormat(e))?;
+                .map_err(ExtractionError::Io)?;
             if bytes_read == 0 {
                 break;
             }
-            outfile.write_all(&buffer[..bytes_read])
-                .map_err(|e| ExtractionError::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to write to {}: {}", dest_path.display(), e),
-                )))?;
+            std::io::Write::write_all(&mut outfile, &buffer[..bytes_read])
+                .map_err(ExtractionError::Io)?;
             bytes_written += bytes_read as u64;
         }
 
@@ -381,6 +404,29 @@ impl ExtractionError {
                 AppError::new(ErrorCategory::Cancelled, "extraction was cancelled"),
             ExtractionError::NotAZipFile => 
                 AppError::new(ErrorCategory::ZipExtraction, "archive is not a valid ZIP file"),
+            ExtractionError::__NeverConstructed => unreachable!("__NeverConstructed variant should never be constructed"),
         }
+    }
+
+    /// Converts an AppError to an ExtractionError.
+    pub fn from_app_error(err: AppError) -> Self {
+        match err.category() {
+            ErrorCategory::Filesystem => ExtractionError::Io(io::Error::new(io::ErrorKind::Other, err.message())),
+            ErrorCategory::ZipExtraction => ExtractionError::ValidationFailed(err.message().to_string()),
+            ErrorCategory::Cancelled => ExtractionError::Cancelled,
+            _ => ExtractionError::ValidationFailed(err.message().to_string()),
+        }
+    }
+}
+
+impl From<io::Error> for ExtractionError {
+    fn from(e: io::Error) -> Self {
+        ExtractionError::Io(e)
+    }
+}
+
+impl From<ZipError> for ExtractionError {
+    fn from(e: ZipError) -> Self {
+        ExtractionError::ZipFormat(e)
     }
 }

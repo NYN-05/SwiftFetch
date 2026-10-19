@@ -2480,7 +2480,7 @@ async fn finalize_claimed(
                 extract_dir: None,
                 overwrite_existing: false,
             };
-            let result = extract_zip(repo_clone, extraction_id, moved_clone, config).await;
+            let result = extract_zip(Arc::new(repo_clone), extraction_id, moved_clone.clone(), config).await;
             match result {
                 Ok(outcome) => {
                     tracing::info!("extraction completed: {} files extracted to {}", outcome.files_extracted, outcome.destination.display());
@@ -2759,6 +2759,32 @@ fn overrun_error(redacted: &str, range_value: &str, span_len: u64) -> AppError {
     .with_source(HttpFailure::transport())
 }
 
+/// Checks if a file is a ZIP archive by reading the magic bytes.
+fn is_zip_file(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .and_then(|mut file| {
+            use std::io::Read;
+            let mut magic = [0u8; 4];
+            file.read_exact(&mut magic)?;
+            Ok(magic)
+        })
+        .map(|magic| magic == [0x50, 0x4B, 0x03, 0x04] || magic == [0x50, 0x4B, 0x05, 0x06] || magic == [0x50, 0x4B, 0x07, 0x08])
+        .unwrap_or(false)
+}
+
+/// Determines the extraction directory for a ZIP archive.
+fn determine_extract_dir(archive_path: &Path, config: &ExtractionConfig) -> PathBuf {
+    if let Some(dir) = &config.extract_dir {
+        dir.clone()
+    } else {
+        let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = archive_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("extracted");
+        parent.join(stem)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2842,6 +2868,7 @@ mod tests {
             &SegmentationPolicy::default(),
             test_clock,
             &handle,
+            true,
         )
         .await
     }
@@ -5579,3 +5606,4 @@ mod tests {
         }
     }
 }
+
