@@ -158,6 +158,11 @@ pub struct Behavior {
     /// the overlong body is legal HTTP): the response body contradicts its
     /// own `Content-Range` length. Clamped by the fixture's end.
     pub overrun_range_by: Option<u64>,
+    /// Phase 10 raw payload: serve exactly these bytes as the route's
+    /// content (Content-Length = this length). When set, the fixture's
+    /// length/range machinery operates over this body instead — needed
+    /// for ZIP payloads that pattern bytes cannot express.
+    pub raw_body: Option<Arc<Vec<u8>>>,
 }
 
 impl Default for Behavior {
@@ -184,6 +189,7 @@ impl Default for Behavior {
             segment_status: None,
             omit_range_total: false,
             overrun_range_by: None,
+            raw_body: None,
         }
     }
 }
@@ -331,8 +337,18 @@ impl Behavior {
         self.overrun_range_by = Some(extra);
         self
     }
-}
 
+    /// Serves exactly these bytes as the route's body (a real ZIP payload,
+    /// a corrupted archive, …) instead of pattern-fixture bytes.
+    ///
+    /// # Panics
+    /// Never; the body is stored as given.
+    #[must_use]
+    pub fn with_raw_body(mut self, bytes: impl Into<Arc<Vec<u8>>>) -> Self {
+        self.raw_body = Some(bytes.into());
+        self
+    }
+}
 /// One request as observed by the mock server, in arrival order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedRequest {
@@ -959,6 +975,12 @@ async fn handle(
     let modified_header = last_modified_value(behavior.last_modified, hit);
 
     let fixture = &behavior.fixture;
+    // Phase 10: a raw payload replaces the pattern fixture's bytes while
+    // keeping the identical length/range machinery.
+    let body_len = match &behavior.raw_body {
+        Some(raw) => raw.len() as u64,
+        None => fixture.len,
+    };
     if method == Method::HEAD {
         if let Some(code) = behavior.head_status {
             return Ok(Response::builder()
@@ -993,7 +1015,7 @@ async fn handle(
                 .body(TestBody::stream(Bytes::new(), STREAM_CHUNK, None, None))
                 .expect("HEAD length-omitted response builds"),
             None => builder
-                .body(TestBody::head_only(fixture.len))
+                .body(TestBody::head_only(body_len))
                 .expect("HEAD response builds"),
         });
     }
@@ -1064,22 +1086,36 @@ async fn handle(
             }
         }
     }
+    // Phase 10: a raw payload substitutes the body bytes while the pattern
+    // fixture keeps driving validators and lie modes (`BrokenBody` stays
+    // fixture-programmed by design).
+    let raw = behavior.raw_body.clone();
+    let full_body = || match &raw {
+        Some(raw) => Arc::clone(raw),
+        None => fixture.bytes(),
+    };
+    let slice_body = |start: u64, end: u64| match &raw {
+        Some(raw) => {
+            let last = (raw.len() as u64).saturating_sub(1);
+            let end = end.min(last);
+            Arc::new(raw[start as usize..=end as usize].to_vec())
+        }
+        None => fixture.slice(start, end),
+    };
     let (range_status, content_range, data, advertised): (
         u16,
         Option<String>,
         Arc<Vec<u8>>,
         Option<u64>,
-    ) = match parse_range(range_header.as_ref(), fixture.len) {
-        RangeParse::Absent | RangeParse::Malformed => {
-            (200, None, fixture.bytes(), Some(fixture.len))
-        }
-        RangeParse::FullCover => (200, None, fixture.bytes(), Some(fixture.len)),
+    ) = match parse_range(range_header.as_ref(), body_len) {
+        RangeParse::Absent | RangeParse::Malformed => (200, None, full_body(), Some(body_len)),
+        RangeParse::FullCover => (200, None, full_body(), Some(body_len)),
         RangeParse::Unsatisfiable => {
             let response = Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header(
                     CONTENT_RANGE,
-                    HeaderValue::from_str(&format!("bytes */{}", fixture.len))
+                    HeaderValue::from_str(&format!("bytes */{}", body_len))
                         .expect("valid Content-Range"),
                 )
                 .body(TestBody::head_only(0))
@@ -1087,20 +1123,20 @@ async fn handle(
             return Ok(response);
         }
         RangeParse::Normal { start, end } => match range_mode {
-            RangeMode::Ignore => (200, None, fixture.bytes(), Some(fixture.len)),
+            RangeMode::Ignore => (200, None, full_body(), Some(body_len)),
             RangeMode::Honor => {
                 let total = if behavior.omit_range_total {
                     "*".to_owned()
                 } else {
-                    fixture.len.to_string()
+                    body_len.to_string()
                 };
                 // `overrun_range_by` streams bytes past the advertised
                 // Content-Range interval and frames the body chunked (no
                 // Content-Length), so a client can only catch the lie by
                 // comparing bytes received against the range it asked for.
                 let (data, advertised) = match behavior.overrun_range_by {
-                    Some(extra) => (fixture.slice(start, end.saturating_add(extra)), None),
-                    None => (fixture.slice(start, end), Some(end - start + 1)),
+                    Some(extra) => (slice_body(start, end.saturating_add(extra)), None),
+                    None => (slice_body(start, end), Some(end - start + 1)),
                 };
                 (
                     206,
@@ -1111,18 +1147,13 @@ async fn handle(
             }
             RangeMode::BrokenHeaders => (
                 206,
-                Some(format!(
-                    "bytes {}-{}/{}",
-                    start + 1,
-                    end + 1,
-                    fixture.len + 7
-                )),
-                fixture.bytes(),
-                Some(fixture.len),
+                Some(format!("bytes {}-{}/{}", start + 1, end + 1, body_len + 7)),
+                full_body(),
+                Some(body_len),
             ),
             RangeMode::BrokenBody => (
                 206,
-                Some(format!("bytes {start}-{end}/{}", fixture.len)),
+                Some(format!("bytes {start}-{end}/{}", body_len)),
                 Fixture::new(fixture.seed + 1, fixture.len).slice(start, end),
                 Some(end - start + 1),
             ),

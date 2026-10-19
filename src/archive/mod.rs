@@ -11,4 +11,5 @@
 
 pub mod zip_extract;
 
-pub use zip_extract::{extract_zip, ExtractionConfig, ExtractionError, ExtractionOutcome};
+pub(crate) use zip_extract::determine_extract_dir;
+pub use zip_extract::{extract_zip, ExtractionConfig};

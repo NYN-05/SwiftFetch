@@ -46,6 +46,7 @@ use std::sync::Arc;
 use reqwest::{Method, StatusCode};
 use tokio::sync::watch;
 
+use crate::archive::{determine_extract_dir, extract_zip, ExtractionConfig};
 use crate::download::http::{http_status_error, HttpClient, HttpFailure};
 use crate::download::probe::{
     parse_content_range, probe, response_meta, validate_url, ContentEncoding, ContentLength,
@@ -63,10 +64,9 @@ use crate::download::sequential::{
 use crate::error::{AppError, ErrorCategory};
 use crate::logging::redact_url;
 use crate::storage::file_writer::{finalize, reserve_destination, PartialFile};
-use crate::archive::{extract_zip, ExtractionConfig, ExtractionOutcome};
 use crate::storage::repository::{
-    DownloadRecord, DownloadState, NewDownload, NewSegment, NewExtraction, Repository, SegmentRecord,
-    SegmentState, TransferFacts,
+    DownloadRecord, DownloadState, NewDownload, NewExtraction, NewSegment, Repository,
+    SegmentRecord, SegmentState, TransferFacts,
 };
 
 /// Statuses from which a record can still be driven to completion.
@@ -514,11 +514,11 @@ async fn run_attempt(ctx: &Attempt<'_>, plan: RecoveryPlan) -> Result<AttemptOut
 /// recovery contract; returns when the transfer completed, failed
 /// terminally, or shutdown was requested.
 ///
-/// The caller owns shutdown (`shutdown`), the retry budget (`policy`), and
-/// the segmentation limits (`segmentation`); the progress handle exists for
-/// diagnostics and tests. The nine parameters are the deliberate contract
-/// of the engine entry point (the Phase 11 command wiring is its only
-/// caller).
+/// The caller owns shutdown (`shutdown`), the retry budget (`policy`), the
+/// segmentation limits (`segmentation`), and the auto-extract switch
+/// (`zip_auto_extract`); the progress handle exists for diagnostics and
+/// tests. The ten parameters are the deliberate contract of the engine
+/// entry point (the Phase 11 command wiring is its only production caller).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn transfer_persisted(
     client: &HttpClient,
@@ -2460,39 +2460,66 @@ async fn finalize_claimed(
         .update_status(record_id, DownloadState::Completed, (ctx.now)(), None)?;
     tracing::info!("download {record_id}: finalized at {}", moved.display());
 
-    // Trigger ZIP extraction if enabled and the file is a ZIP archive.
+    // Automatic ZIP extraction (Phase 10): the record is completed and the
+    // file renamed — extraction only ever happens after finalization. The
+    // file name's extension is only a hint; `is_zip_file` decides by magic
+    // bytes. The extraction runs in place here (its own record lives in
+    // the `extractions` table, queued → extracting → completed/failed), so
+    // the command outcome and every test observe a settled extraction
+    // state. A failing extraction never flips the completed download: the
+    // archive stays intact and the failure is reported through the
+    // extraction record and the log — extraction retries have no HTTP
+    // surface and never trigger a new download.
     if ctx.zip_auto_extract && is_zip_file(&moved) {
-        tracing::info!("download {record_id}: starting automatic ZIP extraction for {}", moved.display());
-        let extraction_id = ctx.repo.insert_extraction(
+        let queued = ctx.repo.insert_extraction(
             record_id,
             NewExtraction {
                 archive_path: moved.clone(),
                 destination: determine_extract_dir(&moved, &ExtractionConfig::default()),
             },
-        )?;
-        // Spawn extraction in background to avoid blocking the download completion
-        let repo_clone = ctx.repo.clone();
-        let moved_clone = moved.clone();
-        let zip_auto_extract = ctx.zip_auto_extract;
-        tokio::spawn(async move {
-            let config = ExtractionConfig {
-                auto_extract: zip_auto_extract,
-                extract_dir: None,
-                overwrite_existing: false,
-            };
-            let result = extract_zip(Arc::new(repo_clone), extraction_id, moved_clone.clone(), config).await;
-            match result {
-                Ok(outcome) => {
-                    tracing::info!("extraction completed: {} files extracted to {}", outcome.files_extracted, outcome.destination.display());
-                }
-                Err(e) => {
-                    tracing::error!("extraction failed for {}: {}", moved_clone.display(), e);
-                }
+        );
+        let extraction_id = match queued {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(
+                    "download {record_id}: the extraction could not be queued ({})\
+                     ; the completed archive stays in place without an \
+                     extraction record",
+                    err.message()
+                );
+                return Ok(moved);
             }
-        });
+        };
+        match extract_zip(
+            ctx.repo,
+            extraction_id,
+            moved.clone(),
+            ExtractionConfig::default(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                tracing::info!(
+                    "download {record_id}: extraction wrote {} file(s), {} bytes, \
+                     to {}; {} existing file(s) were skipped by the \
+                     no-silent-overwrite policy",
+                    outcome.files_extracted,
+                    outcome.bytes_written,
+                    outcome.destination.display(),
+                    outcome.skipped_files.len(),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "download {record_id}: extraction failed ({}); the archive \
+                     stays intact and the extraction can be retried",
+                    err
+                );
+            }
         }
-        Ok(moved)
     }
+    Ok(moved)
+}
 
 /// The `FinalizeAvailable` plan's own finishing path (no network work at
 /// all): the file is already complete and confirmed.
@@ -2760,6 +2787,12 @@ fn overrun_error(redacted: &str, range_value: &str, span_len: u64) -> AppError {
 }
 
 /// Checks if a file is a ZIP archive by reading the magic bytes.
+///
+/// Phase 10 detection policy: the transfer's file name and its extension
+/// are only hints — the local-file-header signatures decide. A plain
+/// resource that coincidentally starts with a PK signature would only be
+/// offered to the extractor, which reports it as a format failure; the
+/// download itself is unaffected.
 fn is_zip_file(path: &Path) -> bool {
     std::fs::File::open(path)
         .and_then(|mut file| {
@@ -2768,21 +2801,12 @@ fn is_zip_file(path: &Path) -> bool {
             file.read_exact(&mut magic)?;
             Ok(magic)
         })
-        .map(|magic| magic == [0x50, 0x4B, 0x03, 0x04] || magic == [0x50, 0x4B, 0x05, 0x06] || magic == [0x50, 0x4B, 0x07, 0x08])
+        .map(|magic| {
+            magic == [0x50, 0x4B, 0x03, 0x04]
+                || magic == [0x50, 0x4B, 0x05, 0x06]
+                || magic == [0x50, 0x4B, 0x07, 0x08]
+        })
         .unwrap_or(false)
-}
-
-/// Determines the extraction directory for a ZIP archive.
-fn determine_extract_dir(archive_path: &Path, config: &ExtractionConfig) -> PathBuf {
-    if let Some(dir) = &config.extract_dir {
-        dir.clone()
-    } else {
-        let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = archive_path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("extracted");
-        parent.join(stem)
-    }
 }
 
 #[cfg(test)]
@@ -3331,6 +3355,7 @@ mod tests {
             &SegmentationPolicy::default(),
             test_clock,
             &handle,
+            false,
         )
         .await
         .expect_err("shutdown was already requested");
@@ -3558,6 +3583,7 @@ mod tests {
                     &SegmentationPolicy::default(),
                     test_clock,
                     &handle,
+                    false,
                 )
                 .await;
                 (result, repo, dir)
@@ -3936,6 +3962,7 @@ mod tests {
                     &SegmentationPolicy::default(),
                     test_clock,
                     &handle,
+                    false,
                 )
                 .await;
                 (result, Arc::clone(&repo), dir)
@@ -4189,6 +4216,7 @@ mod tests {
             policy,
             test_clock,
             &handle,
+            false,
         )
         .await
     }
@@ -4735,6 +4763,7 @@ mod tests {
                     &policy,
                     test_clock,
                     &handle,
+                    false,
                 )
                 .await;
                 (result, repo, dir)
@@ -5380,6 +5409,7 @@ mod tests {
                 &segmentation,
                 test_clock,
                 &handle,
+                false,
             )
             .await
         });
@@ -5580,30 +5610,350 @@ mod tests {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    /// Checks if a file is a ZIP archive by reading the magic bytes.
-    fn is_zip_file(path: &Path) -> bool {
-        std::fs::File::open(path)
-            .and_then(|mut file| {
-                use std::io::Read;
-                let mut magic = [0u8; 4];
-                file.read_exact(&mut magic)?;
-                Ok(magic)
-            })
-            .map(|magic| magic == [0x50, 0x4B, 0x03, 0x04] || magic == [0x50, 0x4B, 0x05, 0x06] || magic == [0x50, 0x4B, 0x07, 0x08])
-            .unwrap_or(false)
+    // ==== Phase 10: automatic ZIP extraction (engine level) ====
+
+    /// Builds a real ZIP archive (DEFLATE entries) at `path`.
+    fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).expect("archive created");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(*name, options).expect("entry started");
+            zip.write_all(bytes).expect("entry written");
+        }
+        zip.finish().expect("archive finished");
     }
 
-    /// Determines the extraction directory for a ZIP archive.
-    fn determine_extract_dir(archive_path: &Path, config: &ExtractionConfig) -> PathBuf {
-        if let Some(dir) = &config.extract_dir {
-            dir.clone()
-        } else {
-            let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
-            let stem = archive_path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("extracted");
-            parent.join(stem)
-        }
+    /// The engine with an explicit auto-extract switch and shutdown pair.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_extract_shutdown(
+        repo: &Repository,
+        server: &MockServer,
+        path: &str,
+        dir: &Path,
+        retries: u32,
+        zip_auto_extract: bool,
+        shutdown: Option<(ShutdownSignal, ShutdownHandle)>,
+    ) -> Result<SequentialDownload, AppError> {
+        let client = HttpClient::default_client().expect("the default client builds");
+        let url = server.url(path);
+        let (_signal, handle) = shutdown.unwrap_or_else(ShutdownSignal::channel);
+        transfer_persisted(
+            &client,
+            repo,
+            &url,
+            dir,
+            Progress::shared(),
+            &RetryPolicy::from_retries(retries),
+            &SegmentationPolicy::default(),
+            test_clock,
+            &handle,
+            zip_auto_extract,
+        )
+        .await
+    }
+
+    /// The engine with an explicit auto-extract switch, never shut down.
+    async fn drive_extract(
+        repo: &Repository,
+        server: &MockServer,
+        path: &str,
+        dir: &Path,
+        retries: u32,
+        zip_auto_extract: bool,
+    ) -> Result<SequentialDownload, AppError> {
+        drive_extract_shutdown(repo, server, path, dir, retries, zip_auto_extract, None).await
+    }
+
+    /// The completed record of a one-record scratch repository.
+    fn the_single_record(repo: &Repository) -> DownloadRecord {
+        let records = repo.list_downloads().expect("records read");
+        assert_eq!(records.len(), 1, "exactly one record exists");
+        records[0].clone()
+    }
+
+    #[tokio::test]
+    async fn a_finalized_zip_extracts_automatically_and_is_tracked_separately() {
+        let server = MockServer::start().await;
+        let (scratch, repo) = scratch_repo("zip-auto");
+        let payload: &[u8] = b"inner payload of the downloaded archive";
+        let build = scratch.path().join("build.zip");
+        make_zip(&build, &[("docs/inner/payload.txt", payload)]);
+        let zip_bytes = std::fs::read(&build).expect("archive bytes read");
+        std::fs::remove_file(&build).expect("build poll removed");
+
+        server.mount_route(
+            "/payload.zip",
+            Behavior::default().with_raw_body(zip_bytes.clone()),
+        );
+
+        let dir = scratch.path().join("out");
+        let download = drive_extract(&repo, &server, "/payload.zip", &dir, 0, true)
+            .await
+            .expect("the download finishes");
+        assert_eq!(download.file_name, "payload.zip");
+
+        let record = the_single_record(&repo);
+        assert_eq!(record.status, DownloadState::Completed);
+        assert_eq!(
+            std::fs::read(&record.destination).expect("archive read"),
+            zip_bytes,
+            "the finalized archive is byte-for-byte the served ZIP"
+        );
+
+        // Extraction tracking is separate from the download record; the
+        // ledger is asserted before the filesystem so a failed run reports
+        // its recorded error instead of an opaque missing-path panic.
+        let rows = repo.list_extractions(record.id).expect("extraction rows");
+        assert_eq!(rows.len(), 1, "exactly one extraction record");
+        assert_eq!(
+            rows[0].state,
+            crate::storage::repository::ExtractionState::Completed,
+            "the extraction record completed: {:#?}",
+            rows[0]
+        );
+        assert!(
+            rows[0].error_category.is_none(),
+            "a completed run carries no error details"
+        );
+        assert_eq!(rows[0].archive_path, record.destination);
+
+        // Extraction destination: a sibling folder next to the archive.
+        let extract_dir = dir.join("payload");
+        assert_eq!(rows[0].destination, extract_dir);
+        assert!(extract_dir.is_dir(), "the extraction destination exists");
+        let extracted = std::fs::read(extract_dir.join("docs").join("inner").join("payload.txt"))
+            .expect("the nested entry was extracted");
+        assert_eq!(extracted.as_slice(), payload, "byte-for-byte extraction");
+        assert_eq!(
+            std::fs::read(&record.destination).expect("archive still readable"),
+            zip_bytes,
+            "the archive is preserved after a successful extraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_is_skipped_when_disabled() {
+        let server = MockServer::start().await;
+        let (scratch, repo) = scratch_repo("zip-disabled");
+        let payload: &[u8] = b"inner payload of a not-to-be-extracted archive";
+        let build = scratch.path().join("build.zip");
+        make_zip(&build, &[("docs/inner/payload.txt", payload)]);
+        let zip_bytes = std::fs::read(&build).expect("archive bytes read");
+        std::fs::remove_file(&build).expect("build poll removed");
+
+        server.mount_route(
+            "/payload.zip",
+            Behavior::default().with_raw_body(zip_bytes.clone()),
+        );
+
+        let dir = scratch.path().join("out");
+        let download = drive_extract(&repo, &server, "/payload.zip", &dir, 0, false)
+            .await
+            .expect("the download finishes");
+        assert_eq!(download.file_name, "payload.zip");
+
+        let record = the_single_record(&repo);
+        assert_eq!(record.status, DownloadState::Completed);
+        assert!(
+            !dir.join("payload").exists(),
+            "a disabled run creates no extraction destination"
+        );
+        assert!(
+            repo.list_extractions(record.id)
+                .expect("extraction rows")
+                .is_empty(),
+            "a disabled run queues no extraction record"
+        );
+        assert_eq!(
+            std::fs::read(&record.destination).expect("archive read"),
+            zip_bytes,
+            "the archive is intact without extraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_zip_completes_with_a_failed_extraction_record() {
+        let server = MockServer::start().await;
+        let (scratch, repo) = scratch_repo("zip-corrupt");
+        let build = scratch.path().join("build.zip");
+        make_zip(&build, &[("keep.txt", b"payload bytes at least")]);
+        let mut zip_bytes = std::fs::read(&build).expect("archive bytes read");
+        std::fs::remove_file(&build).expect("build poll removed");
+        // Lose the central directory: the transfer can still fetch and
+        // finalize these bytes; the extraction must fail on them.
+        zip_bytes.truncate(zip_bytes.len().saturating_sub(4));
+
+        server.mount_route(
+            "/bad.zip",
+            Behavior::default().with_raw_body(zip_bytes.clone()),
+        );
+
+        let dir = scratch.path().join("out");
+        let _download = drive_extract(&repo, &server, "/bad.zip", &dir, 0, true)
+            .await
+            .expect("the download finishes despite the corrupted archive");
+
+        let record = the_single_record(&repo);
+        assert_eq!(record.status, DownloadState::Completed);
+        assert_eq!(
+            std::fs::read(&record.destination).expect("archive read"),
+            zip_bytes,
+            "the corrupted archive is preserved byte-for-byte on disk"
+        );
+
+        // The extraction failed and is tracked separately (zip-extraction
+        // category), while the download record stays completed.
+        let rows = repo.list_extractions(record.id).expect("extraction rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            crate::storage::repository::ExtractionState::Failed
+        );
+        assert_eq!(
+            rows[0].error_category,
+            Some(ErrorCategory::ZipExtraction),
+            "the failure is categorized for the extraction state"
+        );
+        assert!(
+            rows[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|m| !m.is_empty()),
+            "the failed run carries error details: {:?}",
+            rows[0].error_message
+        );
+
+        // A re-invocation adopts the completed record and does not queue
+        // another extraction run: retries are an extraction-level concern.
+        let _ = drive_extract(&repo, &server, "/bad.zip", &dir, 0, true)
+            .await
+            .expect("re-invocation stays idempotent");
+        assert_eq!(
+            repo.list_extractions(record.id)
+                .expect("extraction rows")
+                .len(),
+            1,
+            "no duplicate extraction rows from re-invocations"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_never_runs_without_finalization() {
+        let server = MockServer::start().await;
+        let (scratch, repo) = scratch_repo("zip-interrupt");
+        // An incompressible ~8 KiB entry: at the mock's 512-byte streaming
+        // frames and 50 ms per frame the body spans ~17 frames (~850 ms),
+        // so the 120 ms shutdown trip lands mid-stream deterministically
+        // instead of racing a single-frame body to completion.
+        let payload: Vec<u8> = (0..8192)
+            .map(|i| crate::common::fixture::pattern_byte(7, i))
+            .collect();
+        let build = scratch.path().join("build.zip");
+        make_zip(&build, &[("docs/deep/payload.txt", &payload)]);
+        let zip_bytes = std::fs::read(&build).expect("archive bytes read");
+        std::fs::remove_file(&build).expect("build poll removed");
+
+        // Serve the genuine ZIP slowly so shutdown lands mid-stream, before
+        // any finalization could happen.
+        server.mount_route(
+            "/slow.zip",
+            Behavior::default()
+                .with_raw_body(zip_bytes)
+                .with_delay_body_ms(50),
+        );
+
+        let dir = scratch.path().join("out");
+        let url = server.url("/slow.zip");
+        let repo = Arc::new(repo);
+        let (signal, handle) = ShutdownSignal::channel();
+        let task = {
+            let repo = Arc::clone(&repo);
+            let dir = dir.clone();
+            let handle = handle.clone();
+            let client = HttpClient::default_client().expect("client builds");
+            tokio::spawn(async move {
+                transfer_persisted(
+                    &client,
+                    &repo,
+                    &url,
+                    &dir,
+                    Progress::shared(),
+                    &RetryPolicy::from_retries(5),
+                    &SegmentationPolicy::default(),
+                    test_clock,
+                    &handle,
+                    true,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        signal.trip();
+
+        let outcome = task.await.expect("task joins");
+        let err = outcome.expect_err("the interrupted transfer reports cancellation");
+        assert_eq!(err.category(), ErrorCategory::Cancelled);
+
+        let record = repo.list_downloads().expect("records read");
+        assert_eq!(record.len(), 1, "the interrupted record is parked");
+        let record = &record[0];
+        assert_ne!(
+            record.status,
+            DownloadState::Completed,
+            "the interrupted transfer never finalizes"
+        );
+        assert!(
+            !dir.join("slow.zip").exists(),
+            "no finalized file exists anywhere"
+        );
+        assert!(
+            !dir.join("slow").exists(),
+            "no extraction destination was ever created"
+        );
+        assert!(
+            repo.list_extractions(record.id)
+                .expect("extraction rows")
+                .is_empty(),
+            "no extraction record exists without finalization"
+        );
+    }
+
+    #[test]
+    fn zip_detection_uses_magic_bytes_not_the_file_name() {
+        let (scratch, _repo) = scratch_repo("zip-detect");
+        let plain = scratch.path().join("plain.bin");
+        std::fs::write(&plain, b"just some bytes").expect("plain written");
+        assert!(!is_zip_file(&plain), "non-PK bytes are not zip-shaped");
+
+        let local = scratch.path().join("local.zip");
+        std::fs::write(&local, [0x50, 0x4B, 0x03, 0x04, 0xAD, 0xDE])
+            .expect("local header bytes written");
+        assert!(
+            is_zip_file(&local),
+            "the local-file-header signature counts"
+        );
+
+        let eocd = scratch.path().join("empty.zip");
+        std::fs::write(
+            &eocd,
+            [
+                0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .expect("end-of-central-directory bytes written");
+        assert!(is_zip_file(&eocd), "the empty-archive signature counts");
+
+        let short = scratch.path().join("short");
+        std::fs::write(&short, [0x50, 0x4B]).expect("short written");
+        assert!(!is_zip_file(&short), "a sub-4-byte file is not zip-shaped");
+
+        let missing = scratch.path().join("absent.zip");
+        assert!(
+            !is_zip_file(&missing),
+            "an unreadable file is never offered to the extractor"
+        );
     }
 }
-
