@@ -3363,7 +3363,7 @@ mod tests {
         )
         .expect("the stale validator stored");
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "changing-resume.bin", &fixture.slice(0, 511));
+        stage_partial(&dir, "changing-resume.bin", fixture.slice(0, 511));
 
         let download = drive(&repo, &server, "/changing-resume.bin", &dir, 5)
             .await
@@ -3430,7 +3430,7 @@ mod tests {
         )
         .expect("the matching validator stored");
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "range-hostile.bin", &fixture.slice(0, 511));
+        stage_partial(&dir, "range-hostile.bin", fixture.slice(0, 511));
 
         let download = drive(&repo, &server, "/range-hostile.bin", &dir, 5)
             .await
@@ -3612,7 +3612,7 @@ mod tests {
             Some(fixture.len),
         );
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "broken-headers.bin", &fixture.slice(0, 511));
+        stage_partial(&dir, "broken-headers.bin", fixture.slice(0, 511));
 
         server.mount_route(
             "/broken-headers.bin",
@@ -3802,7 +3802,7 @@ mod tests {
             Some(fixture.len),
         );
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "resume-404.bin", &fixture.slice(0, 511));
+        stage_partial(&dir, "resume-404.bin", fixture.slice(0, 511));
 
         let err = drive(&repo, &server, "/resume-404.bin", &dir, 5)
             .await
@@ -3953,7 +3953,7 @@ mod tests {
             Some(fixture.len),
         );
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "unvalidated.bin", &fixture.slice(0, 511));
+        stage_partial(&dir, "unvalidated.bin", fixture.slice(0, 511));
 
         // The first GET drops mid-body; the retry goes through the restart
         // path (no validator to revalidate), which must not send If-Range.
@@ -4834,8 +4834,8 @@ mod tests {
 
         // Stage partial file with first 16 KiB (segments 0 & 1 complete) + 4 KiB of segment 2
         let mut content = Vec::with_capacity(20480);
-        content.extend_from_slice(&fixture.slice(0, 16383));
-        content.extend_from_slice(&fixture.slice(16384, 20479));
+        content.extend_from_slice(fixture.slice(0, 16383));
+        content.extend_from_slice(fixture.slice(16384, 20479));
         stage_partial_with_content(&dir, "segmented.bin", &content);
 
         let download = drive(&repo, &server, "/segmented.bin", &dir, 0)
@@ -4930,7 +4930,7 @@ mod tests {
         );
 
         // Stage partial with first segment
-        stage_partial_with_content(&dir, "seg-validator.bin", &fixture.slice(0, 16383));
+        stage_partial_with_content(&dir, "seg-validator.bin", fixture.slice(0, 16383));
 
         // The recovery should detect validator change and restart
         let download = drive(&repo, &server, "/seg-validator.bin", &dir, 5)
@@ -4998,7 +4998,7 @@ mod tests {
         );
 
         // Stage partial with ONLY first segment (16 KiB) - second segment missing
-        stage_partial_with_content(&dir, "seg-truncated.bin", &fixture.slice(0, 16383));
+        stage_partial_with_content(&dir, "seg-truncated.bin", fixture.slice(0, 16383));
 
         // Recovery should re-fetch the second segment
         let download = drive(&repo, &server, "/seg-truncated.bin", &dir, 0)
@@ -5142,7 +5142,7 @@ mod tests {
             ],
         );
 
-        stage_partial_with_content(&dir, "seg-unknown-size.bin", &fixture.slice(0, 16383));
+        stage_partial_with_content(&dir, "seg-unknown-size.bin", fixture.slice(0, 16383));
 
         // Should restart from zero
         let _download = drive(&repo, &server, "/seg-unknown-size.bin", &dir, 0)
@@ -5209,8 +5209,8 @@ mod tests {
         );
 
         let mut content = Vec::with_capacity(12288);
-        content.extend_from_slice(&fixture.slice(0, 8191));
-        content.extend_from_slice(&fixture.slice(8192, 12287));
+        content.extend_from_slice(fixture.slice(0, 8191));
+        content.extend_from_slice(fixture.slice(8192, 12287));
         stage_partial_with_content(&dir, "seg-idempotent.bin", &content);
 
         // First recovery run
@@ -5294,7 +5294,7 @@ mod tests {
             ],
         );
 
-        stage_partial_with_content(&dir, "seg-shutdown.bin", &fixture.slice(0, 16383));
+        stage_partial_with_content(&dir, "seg-shutdown.bin", fixture.slice(0, 16383));
 
         // Create a shutdown signal we can trip
         let (signal, handle) = ShutdownSignal::channel();
@@ -5516,3 +5516,4 @@ mod tests {
         Ok(format!("{:x}", hasher.finalize()))
     }
 }
+
