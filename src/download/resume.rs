@@ -4834,8 +4834,8 @@ mod tests {
 
         // Stage partial file with first 16 KiB (segments 0 & 1 complete) + 4 KiB of segment 2
         let mut content = Vec::with_capacity(20480);
-        content.extend_from_slice(&*fixture.slice(0, 16383));
-        content.extend_from_slice(&*fixture.slice(16384, 20479));
+        content.extend_from_slice(&fixture.slice(0, 16383));
+        content.extend_from_slice(&fixture.slice(16384, 20479));
         stage_partial_with_content(&dir, "segmented.bin", &content);
 
         let download = drive(&repo, &server, "/segmented.bin", &dir, 0)
