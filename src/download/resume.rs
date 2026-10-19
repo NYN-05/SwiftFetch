@@ -3953,7 +3953,7 @@ mod tests {
             Some(fixture.len),
         );
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "unvalidated.bin", &*fixture.slice(0, 511));
+        stage_partial(&dir, "unvalidated.bin", &fixture.slice(0, 511));
 
         // The first GET drops mid-body; the retry goes through the restart
         // path (no validator to revalidate), which must not send If-Range.
