@@ -1966,6 +1966,7 @@ async fn resume_attempt(
 ///    the response, and writes to the partial file at the correct offset.
 /// 4. On shutdown, persists confirmed progress and parks the record `paused`.
 /// 5. On completion of all segments, verifies the total file length and finalizes.
+#[allow(clippy::redundant_locals)]
 async fn segmented_resume_attempt(
     ctx: &Attempt<'_>,
     record: DownloadRecord,
