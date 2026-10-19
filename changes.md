@@ -1909,6 +1909,56 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
     resident process (the PRD excludes them); every command is a
     one-shot process invocation.
 
+### Phase 11 verification addendum (post-commit, appended 2026-10-19)
+
+- **Commit carrying Phase 11:** `Phase 11: Wire download, status, resume,
+  and retry to the engine and storage (v0.13.0)` (`ccde286`; 17 files,
+  3,109 insertions / 253 deletions - code, tests, `README.md`, and this
+  entry together; the git status was empty right after the commit). The
+  ADR-0023 body and its addendum-index row are inside `decision.md` in the
+  same commit. The hash is recorded here and in `git log`, not inside the
+  entry above (the entry cannot know its own hash; ADR-0008).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: local `git clone` of
+  `ccde286` to a fresh temp directory on Windows - MSVC, rustc 1.99.1,
+  zero files carried over; the clone was removed after the run; recipe in
+  order):
+  - `cargo fmt --check` - pass (exit 0).
+  - `cargo clippy --all-targets --all-features -- -D warnings` - pass,
+    exit 0 (47.1 s cold).
+  - plain `cargo build` - pass, exit 0 (58.6 s cold).
+  - `cargo test --no-fail-fast`, cold:
+    - unit target: **275 passed / 8 failed** (149.4 s). The seven
+      inherited Phase 9-lineage failures reproduced exactly (same test
+      names, same `resume.rs` panic lines, as listed in the Phase 10
+      addendum and the entry's disclosure above). The eighth was
+      `storage::file_writer::tests::partial_files_are_identifiable_and_
+      finalize_by_rename` (panic at `file_writer.rs:588`, a byte-content
+      read-back assertion) - **a second unit-suite run in the same clone
+      (warm) gave 276 passed / 7 failed: exactly the inherited seven, and
+      that test passed**; it also passed twice in isolation in the clone
+      (0.01 s / 0.02 s) and in both working-tree full runs of the entry's
+      verification table. Recorded as a transient environment flake of the
+      parallel filesystem/socket suite, **not** a reproduction: it never
+      reproduced and did not appear in any other run of four.
+    - `tests/cli.rs`: 24 passed, 0 failed (5.9 s).
+    - `tests/fixtures.rs`: 15 passed, 0 failed (0.01 s).
+    - `tests/mock_server.rs`: 33 passed, 0 failed (2.0 s).
+  - `cargo test --bin swift-fetch` again (warm) - 276 passed, 7 failed
+    (176.7 s): the same seven inherited ones, nothing else.
+- **Verdict:** the cold clone reproduces the working tree's result set:
+  every Phase 11 surface (all 24 CLI end-to-end tests, both new render
+  modules' unit tests, the two changed repository tests) is green, and the
+  seven segmented-recovery failures are inherited defects that appear in
+  every run on both trees - the disclosed Phase 9-lineage list, not a
+  Phase 11 regression and not a flake of a single run. The one-off
+  file_writer flake is disclosed above with its full observation record;
+  renaming, partial-name, and finalize-by-rename behavior it covers is
+  green everywhere it was re-observed.
+- This addendum records only its own commit hash and the fresh-clone gate
+  results; the seven pre-existing Phase 9 failures remain unowned (the
+  phase-boundary law) pending the owner's explicit decision on a Phase 9
+  repair.
+
 
 
 
