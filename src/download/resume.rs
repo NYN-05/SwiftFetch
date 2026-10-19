@@ -4770,7 +4770,8 @@ mod tests {
     /// Helper to stage a partial file with specific content.
     fn stage_partial_with_content(dir: &Path, file_name: &str, content: impl AsRef<Vec<u8>>) {
         let partial_name = format!("{file_name}.swiftfetch-{}-1.part", std::process::id());
-        std::fs::write(dir.join(partial_name), content.as_ref().as_slice()).expect("partial staged");
+        std::fs::write(dir.join(partial_name), content.as_ref().as_slice())
+            .expect("partial staged");
     }
 
     /// Helper to get segment rows for a record.
@@ -5396,7 +5397,8 @@ mod tests {
         );
 
         // Final file exists
-        std::fs::write(dir.join("seg-complete.bin"), &*fixture.bytes()).expect("final file written");
+        std::fs::write(dir.join("seg-complete.bin"), &*fixture.bytes())
+            .expect("final file written");
 
         // Drive should return AlreadyComplete without network requests
         let download = drive(&repo, &server, "/seg-complete.bin", &dir, 0)
@@ -5514,9 +5516,3 @@ mod tests {
         Ok(format!("{:x}", hasher.finalize()))
     }
 }
-
-
-
-
-
-
