@@ -1,6 +1,6 @@
 [package]
 name = "swift-fetch"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "SwiftFetch — Windows-first command-line download manager"
 publish = false
@@ -64,4 +64,4 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", 
 http-body-util = "0.1"
 bytes = "1"
 sha2 = "0.10"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

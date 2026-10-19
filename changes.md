@@ -1959,6 +1959,195 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
   phase-boundary law) pending the owner's explicit decision on a Phase 9
   repair.
 
+## Phase 12: Windows resilience and failure hardening (v0.14.0)
+
+- **Commit:** this entry commits with the phase work (the entry cannot
+  know its own hash); the post-commit verification addendum below records
+  it together with the fresh-clone gate.
+- **Scope:** the phase's objective is in its name - verify and harden
+  Windows behavior. What changed: (a) the new end-to-end
+  target `tests/windows.rs` (24 tests) locking reserved/illegal/overlong
+  names, access-denied, occupied destinations, foreign locks (file and
+  database), deep-path branches per the machine's real long-path
+  setting, same-scope and cross-process concurrency, a bounded large
+  queue with mock-observed concurrency caps and a working-set probe, and
+  the clean-install surface; (b) two engine hardenings its tests found;
+  (c) a test-only `windows-sys 0.61.2` dev-dependency for the real
+  Windows lock primitive and (during diagnostics) the console-delivery
+  probes; (d) honest disclosures for everything not deterministically
+  simulable in this harness.
+- **Note on the sweep commit `2bb4b6e`:** the owner committed the phase's
+  mid-grey state (first `tests/windows.rs` snapshot, both engine
+  fixes, the `windows-sys` dev-dep lines, and the `file_writer`
+  file-level `dead_code` waiver removal) under a generic "refactor"
+  message; the phase commit below carries the completed suite, the
+  version bump, and the tracking files. The `2bb4b6e` message predates
+  this entry by hours and is left untouched per the append-only law.
+- **Engine changes (found by the phase's own tests, fixed with tests -
+  no test was weakened, skipped, or aligned to old behavior):**
+  1. `src/download/resume.rs` - `reconcile_download` creates the output
+     directory (`ensure_output_dir`) before `scan_partials`. Before:
+     `-o <never-created nested path>` failed typed with "the output
+     directory ... could not be read to look for previous transfers'
+     partial files: os error 3" because the recovery scan ran before the
+     creation the attempt would have performed anyway - the engine
+     rejected a destination it is allowed to create. After: fresh
+     nested destinations are created on demand; true filesystem
+     failures (write-denied, occupied-by-file) still propagate typed.
+     Locked by `a_deep_output_directory_is_created_end_to_end` (and the
+     denied/occupied tests that guard the boundary).
+  2. `src/storage/file_writer.rs` - `PartialFile::create` re-caps the
+     stem via `cap_units(name, suffix_utf16_units)` before appending
+     `.swiftfetch-<pid>-<seq>.part`. Before: a final name at the
+     ADR-0016 cap (255 UTF-16 units, existing test-locked contract)
+     produced partial names of ~280 units - a per-component limit
+     violation that fails *creation*, so near-limit-named files could
+     never download at all (long paths widen the total path, never the
+     component). After: creation succeeds up to the legal budget.
+     Disclosed cost, deliberate: recovery matches prior partials by the
+     `{file_name}.swiftfetch-` prefix, so a capped partial of an
+     overlong name no longer prefix-matches after a crash and that one
+     interrupted transfer restarts from zero - a full honest restart,
+     no corruption, and strictly better than the previously impossible
+     download. Locked by
+     `an_overlong_effective_name_is_capped_at_255_units_end_to_end`.
+  3. The file-level `#![allow(dead_code)]` waiver was removed from
+     `file_writer.rs` (all its surface is wired since Phase 11), keeping
+     `-D warnings` honest without widening any waiver.
+- **Test infrastructure changes:**
+  1. `windows-sys 0.61.2` as a `[dev-dependencies]`-only dependency
+     (ADR-0024; ADR-0013 discipline): the real Windows exclusive lock
+     (share-mode-0 `CreateFileW` behind a `Drop`-closing `ExclusiveLock`)
+     for `an_engine_partial_held_locked_failed...` and
+     `a_database_locked_by_a_foreign_handle...`, plus the console
+     P/Invoke used during the delivery probes. Features trimmed to
+     exactly what is used (`Win32_Foundation`,
+     `Win32_Storage_FileSystem`); the crate never links into the product
+     binary - plain `cargo build` re-locks that boundary per recipe.
+  2. Milestone-anchored kills (ADR-0024): clock-based kills proved
+     unreliable under parallel load - a +600 ms kill was observed
+     landing on an engine that had not committed a record yet, failing
+     downstream assertions for reasons unrelated to the recovery
+     contract. Every kill-based test now waits for the first/second
+     engine partial file to hold `min_partial_bytes` (read through an
+     open handle - directory-cached metadata reports 0 indefinitely on
+     Windows for a file another process actively writes) and only then
+     `TerminateProcess`es; every kill is followed by a full `wait()`
+     reap (an early variant raced the in-termination child with an
+     exclusive open, os error 32).
+  3. The temporary diagnostic probe test and the console-delivery test
+     code were removed before the phase commit; no probe code ships
+     except the probe *results*, recorded here and in ADR-0024.
+- **Corrections and disclosures (superseding where noted):**
+  1. **Correction to the Phase 11 entry's test list.** The Phase 11
+     entry's coverage list claimed a "graceful Ctrl+C: shutdown parking"
+     e2e suite item. No such test exists and none existed; the intended
+     graceful e2e was not delivered in Phase 11 and its absence is owned
+     here. The engine-side shutdown-parking contract remains
+     unit-locked (`segmented_recovery_shutdown_parks_paused` and the
+     Phase 6 shutdown tests, two of which are among the inherited
+     failures), and Phase 12 ships the OS-interruption-covered
+     intersections it could deliver honestly (below).
+  2. **Graceful console-event delivery is not simulatable here.** Three
+     probe campaigns, all on this Windows machine with observed results
+     (ADR-0024 item 4 for the full record): (a) an in-process
+     `AttachConsole` + `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)`
+     bridge aimed at a private-console engine child - the call
+     structures succeeded, the child ignored the event and completed
+     the full transfer (exit 0, honest summary); (b) a registered-handler
+     probe child reporting its own `SetConsoleCtrlHandler` result -
+     `REGISTER-OK=True LastErr=0`, and the accepted event never occurred
+     to the handler; (c) a real Ctrl keystroke injected into the
+     child's console input buffer (`WriteConsoleInputW`, written=2) -
+     the child later died with `STATUS_CONTROL_C_EXIT` confidently on
+     the *default* disposition route (no summary, and the same route
+     that correctly killed a handler-less probe child). Net: accepted
+     events reach the console, but no handler ever dispatches under
+     this runner's console host chain - so a graceful Ctrl+C e2e here
+     would either fake observability or test the harness. Per the
+     phase spec's explicit allowance, the graceful e2e is disclosed
+     rather than shipped; the graceful engine contract stays
+     unit-locked, and the interrupt-recoverable surface is covered end
+     to end by the forced-termination suite (single transfer, multiple
+     active transfers, repeated startup/shutdown cycles - all through
+     the real `resume` CLI, all byte-exact).
+  3. **Disk-full** is not deterministically simulable in this harness
+     (no reliable absolute-space exhaustion primitive on Windows in CI
+     conditions). The discoverable write-failure paths *are* tested:
+     access-denied outputs, file-occupied outputs, occupied finalize
+     targets, and the exhausted-candidate finalize path (unit-locked).
+  4. **Cross-volume finalization** is impossible by construction in
+     this harness (every scratch lives on one local volume), consistent
+     with ADR-0014's same-volume-rename contract; the rename finalizer
+     and its no-overwrite sibling policy are locked by the suite that
+     exercises them on the same volume.
+  5. **Cross-process same-scope first-submission race**: the schema
+     carries no `UNIQUE(url, destination)` and never claimed one (the
+     unique ownership is (scope, unfinished) one-record invariant
+     enforced by adoption logic, not a constraint). Two processes
+     submitting the identical URL to the identical new directory at
+     the identical instant can both insert one record each before
+     either adopts; later invocations then refuse the scope typed with
+     the multiplicity error ("cannot share one destination plan").
+     `concurrent_same_scope_processes_never_corrupt_or_fake_success`
+     exercises exactly this and asserts the honest outcome (exit ∈
+     {0, 1}, final states ∉ corrupted, no fake success, no duplicate
+     content files). Not fixed as a UNIQUE constraint this phase -
+     that requires a migration and an adopt-order policy for duplicate
+     inserts, an owner decision recorded in ADR-0024; the phase's
+     finding: single-user assumption, typed refusal, no corruption.
+  6. **Windows read-only attribute ignored on directories**: the
+     classic "readonly dir" test would exercise nothing; access-denied
+     is instead granted as `icacls /deny *S-1-1-0:(OI)(CI)(WD,AD)` and
+     released deterministically (`/remove:d`) - observed deterministic
+     on this machine. `a_write_denied_output_directory_fails_typed_...`
+     locks the typed failure + `failed` record with filesystem reason.
+  7. **Kill-inside-rename window** (panic between file rename and DB
+     commit): not simulatable - the window is sub-millisecond; the
+     interlock covered (crash between DB write and file existence,
+     plus partial-loss recovery degrading to a full restart) *is* the
+     testable half and is locked by the interrupted-partial tests.
+  8. The unit-suite note: the seven failures in every full run are the
+     inherited Phase 9-lineage segmented-recovery set, unchanged
+     (identical names and panic lines to the Phase 10/11 records);
+     Phase 12 touched none of them, per the phase-boundary law.
+- **Verification - canonical recipe in this working tree, v0.14.0,
+  2026-10-20 (all results actually observed):**
+  - `cargo fmt --check` - pass (exit 0).
+  - `cargo clippy --all-targets --all-features -- -D warnings` - pass
+    (swift-fetch v0.14.0, finished 7.6 s warm).
+  - plain `cargo build` - pass, exit 0 (15.2 s).
+  - `cargo test --no-fail-fast` (152.2 s):
+    - unit target: **276 passed / 7 failed** - the seven inherited
+      Phase 9-lineage failures, names and panic lines identical to the
+      Phase 10/11 records (`segmented_recovery_failed_segment_retried`,
+      `segmented_recovery_handles_oversized_partial`,
+      `segmented_recovery_failed_segment_retried`-related ranges,
+      `segmented_recovery_handles_truncated_partial`,
+      `segmented_recovery_handles_unknown_size`,
+      `segmented_recovery_skips_verified_completed_segments`,
+      `segmented_recovery_shutdown_parks_paused`,
+      `a_truncated_segment_is_retried_within_the_budget...`).
+    - `tests/cli.rs`: **24 passed / 0 failed** (6.2 s).
+    - `tests/fixtures.rs`: **15 passed / 0 failed** (0.04 s).
+    - `tests/mock_server.rs`: **33 passed / 0 failed** (2.1 s).
+    - `tests/windows.rs`: **24 passed / 0 failed** (6.5 s) - the phase's
+      new target; additionally stable across four consecutive parallel
+      full-target runs during development (24/24 each).
+  - Acceptance mapping (spec checklist → evidence, all on Windows):
+    invalid/reserved/overlong filenames and path semantics → the
+    reserved-stem, illegal-character, overlong-cap, deep-path tests;
+    access-denied/locked/duplicate → the
+    icacls-deny, ExclusiveLock, occupied/sibling tests; disk-full →
+    disclosed (item 3); interruption → forced-termination trio + cycle
+    test (+ the disclosed graceful route, item 2); unbounded resource
+    guard → the large-queue test (mock-observed ≤ global cap, working
+    set probe); no service/daemon/auto-start → the clean-install test;
+    app-data DB path + concurrent access → the LOCALAPPDATA refusal and
+    the two concurrent-process tests; cross-volume → disclosed
+    (item 4).
+
+
 
 
 

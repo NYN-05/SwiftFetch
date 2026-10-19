@@ -15,29 +15,30 @@
 //! - concurrent child processes share one SQLite database without
 //!   corruption, and the same-scope cross-process race is exercised to
 //!   observe its honest outcome (single-user assumption, ADR-0017);
-//! - graceful Ctrl+C (one and several active downloads) and hard forced
-//!   termination recover through the actual `resume` CLI;
+//! - graceful and forced OS-level interruption are handled through the
+//!   actual `resume` CLI (forced termination is exercised directly; the
+//!   graceful console-delivery route is disclosed below);
 //! - a large queue respects the global concurrency limit and stays within
 //!   a generous working-set bound;
 //! - a clean run installs no service, auto-start entry, or resident
 //!   process, and a missing `LOCALAPPDATA` refuses typed.
 //!
-//! Orchestration: console events and exclusive locks come from the
-//! test-only `windows-sys` dev-dependency (first use ADR-0023 lineage,
-//! recorded as ADR-0024) — `AttachConsole` + `GenerateConsoleCtrlEvent`
-//! against the child's *private* console (the child spawns with
-//! CREATE_NEW_CONSOLE) has no blast radius beyond that child, and a
-//! share-mode-0 `CreateFileW` handle is the byte-exact Windows exclusive
-//! lock. Machine-wide snapshots (auto-start surface, working set) still
-//! go through windowless PowerShell helpers, read only after exit, which
-//! their buffering cannot affect.
+//! Orchestration: exclusive locks come from the test-only `windows-sys`
+//! dev-dependency (first use recorded as ADR-0024) — a share-mode-0
+//! `CreateFileW` handle is the byte-exact Windows "file locked" state.
+//! Machine-wide snapshots (auto-start surface, working set) go through
+//! windowless PowerShell helpers, read only after exit, which their
+//! buffering cannot affect.
 //!
-//! Environment honesty (per the phase spec and the Windows honesty rule):
-//! every check in this file was executed on Windows; failure modes that
-//! cannot be simulated reliably here (true disk-full, a cross-volume
-//! finalize, a kill inside the sub-millisecond rename window) are
-//! disclosed in the Phase 12 tracking entry instead of being faked by
-//! this suite.
+//! Delivery honesty: graceful OS console event delivery is NOT exercised —
+//! three probe campaigns on this runner (details in the forced-termination
+//! section header) showed the accepted console event never dispatches to
+//! any registered handler under the OpenCode console host, so a graceful
+//! Ctrl+C e2e would test the host, not the product; the engine's
+//! graceful-shutdown contract is unit-locked there instead. Failure modes
+//! that cannot be simulated reliably here (true disk-full, a cross-volume
+//! finalize, a kill inside the sub-millisecond rename window) are disclosed
+//! in the Phase 12 tracking entry instead of being faked by this suite.
 
 mod common;
 
@@ -50,12 +51,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
-use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, ATTACH_PARENT_PROCESS, CTRL_C_EVENT,
-};
 
-/// The child gets its own private console so a delivered Ctrl+C event can
-/// be aimed at exactly one process (see `deliver_ctrl_c`).
+/// Each engine child runs in its own private console: the harness never
+/// shares a console with any child it drives.
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 /// PowerShell orchestrators run windowless; the flash of a console would
 /// only make test output noisier.
@@ -179,9 +177,55 @@ async fn wait_for_child(child: Child) -> Output {
         .expect("the waiter thread reports the child's output")
 }
 
+/// Waits until the engine under test has at least `expected` engine partial
+/// files of at least `min_partial_bytes` in `scratch` — the observable
+/// milestone proving the persistent record inserts committed (the engine
+/// writes no network byte before its record) and body bytes are already
+/// flushed to the partials. A kill-based test aimed by the clock can fire
+/// before a cold, loaded child ever gets there; this anchors the kill to
+/// engine progress instead.
+///
+/// Sizes are read through an open handle on purpose: a data-open read also
+/// returns fresh sizes for a file another process actively writes, while
+/// directory-cached metadata (`DirEntry::metadata`) indefinitely reports 0
+/// on Windows for such a file.
+async fn wait_until_partial_transfer_started(
+    scratch: &Scratch,
+    expected: usize,
+    min_partial_bytes: u64,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let anchored = std::fs::read_dir(scratch.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                    .filter(|entry| {
+                        std::fs::File::open(entry.path())
+                            .ok()
+                            .and_then(|file| file.metadata().ok())
+                            .is_some_and(|meta| meta.len() >= min_partial_bytes)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if anchored >= expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the engine never reached {expected} partial file(s) with \
+             {min_partial_bytes} bytes each, so there is no mid-transfer \
+             point to force-terminate"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+}
+
 // -------------------------------------------------------------------------
-// PowerShell orchestration (ADR-0024): console events, foreign locks,
-// environment snapshots, and working-set probes — all windowés.
+// PowerShell orchestration (ADR-0024): foreign locks, environment
+// snapshots, and working-set probes - all windowless.
 // -------------------------------------------------------------------------
 
 async fn run_powershell(script: &Path, args: &[&str]) -> Output {
@@ -195,39 +239,6 @@ async fn run_powershell(script: &Path, args: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
     run_command(command).await
-}
-
-/// Delivers a graceful CTRL_C to the child's *private* console from this
-/// test process.
-///
-/// `AttachConsole(child_pid)` binds this runner to the one console the
-/// child spawned into (CREATE_NEW_CONSOLE), so
-/// `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` reaches exactly that
-/// child — no parallel-runner test child shares the blast radius. The
-/// runner detaches its own console for an instant and re-attaches its
-/// parent's console afterwards, since its stdio is captured either way.
-async fn deliver_ctrl_c(child_pid: u32) {
-    let outcome = tokio::task::spawn_blocking(move || {
-        // SAFETY: plain Win32 console and process calls; the handles
-        // belong to consoles this process isolates via FreeConsole.
-        unsafe {
-            FreeConsole();
-            if AttachConsole(child_pid) == 0 {
-                // Re-join our own console session before reporting, so a
-                // failed delivery never blinds the test runner.
-                FreeConsole();
-                AttachConsole(ATTACH_PARENT_PROCESS);
-                return Err("AttachConsole to the child's console failed");
-            }
-            GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-            FreeConsole();
-            AttachConsole(ATTACH_PARENT_PROCESS);
-            Ok(())
-        }
-    })
-    .await
-    .expect("the console bridging runs on a blocking task");
-    outcome.expect("the test must be able to aim a CTRL_C at its own child");
 }
 
 /// A foreign exclusive handle (share mode 0) held on one path for the
@@ -349,8 +360,12 @@ fn assert_no_leftover_partials(output_dir: &Path) {
 }
 
 fn assert_file_bytes(path: &Path, expected: &[u8], context: &str) {
-    let actual = std::fs::read(path)
-        .unwrap_or_else(|err| panic!("{context}: the file {} must be readable: {err}", path.display()));
+    let actual = std::fs::read(path).unwrap_or_else(|err| {
+        panic!(
+            "{context}: the file {} must be readable: {err}",
+            path.display()
+        )
+    });
     assert_eq!(actual, expected, "{context}: byte-exact content");
 }
 
@@ -365,7 +380,7 @@ fn assert_file_bytes(path: &Path, expected: &[u8], context: &str) {
 async fn a_reserved_stem_url_never_reaches_a_windows_device() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/CON.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/CON.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("reserved-name");
 
     let output = run_in(&scratch, &["download", &server.url("/CON.bin")]).await;
@@ -373,7 +388,11 @@ async fn a_reserved_stem_url_never_reaches_a_windows_device() {
 
     let sanitized = scratch.path().join("_CON.bin");
     assert!(sanitized.exists(), "the neutralized name must exist");
-    assert_file_bytes(&sanitized, fixture.bytes().as_slice(), "reserved-stem download");
+    assert_file_bytes(
+        &sanitized,
+        fixture.bytes().as_slice(),
+        "reserved-stem download",
+    );
     // No sibling attempt is expected: naming renames, it never writes
     // through the device name.
     let stranded: Vec<String> = std::fs::read_dir(scratch.path())
@@ -396,11 +415,15 @@ async fn illegal_url_characters_sanitize_for_windows_end_to_end() {
     let fixture = Fixture::default();
     server.mount_route(
         "/bad%3A%3C%3Ename.bin",
-        Behavior::default().with_fixture(fixture.clone()),
+        Behavior::default().with_fixture(fixture),
     );
     let scratch = Scratch::new("illegal-chars");
 
-    let output = run_in(&scratch, &["download", &server.url("/bad%3A%3C%3Ename.bin")]).await;
+    let output = run_in(
+        &scratch,
+        &["download", &server.url("/bad%3A%3C%3Ename.bin")],
+    )
+    .await;
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
 
     let sanitized = scratch.path().join("bad___name.bin");
@@ -408,7 +431,11 @@ async fn illegal_url_characters_sanitize_for_windows_end_to_end() {
         sanitized.exists(),
         "the sanitized name must exist instead of the decoded illegal one"
     );
-    assert_file_bytes(&sanitized, fixture.bytes().as_slice(), "illegal-chars download");
+    assert_file_bytes(
+        &sanitized,
+        fixture.bytes().as_slice(),
+        "illegal-chars download",
+    );
 }
 
 /// An overlong effective name is capped at the Windows per-component limit
@@ -420,10 +447,7 @@ async fn an_overlong_effective_name_is_capped_at_255_units_end_to_end() {
     // 400 'a' + ".bin" overflows 255 units; the cap keeps ".bin".
     let long_segment = format!("{}{}", "a".repeat(400), ".bin");
     let route = format!("/{long_segment}");
-    server.mount_route(
-        &route,
-        Behavior::default().with_fixture(fixture.clone()),
-    );
+    server.mount_route(&route, Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("overlong-name");
 
     let url = format!("{}{}", server.url("/"), long_segment);
@@ -452,7 +476,7 @@ async fn an_overlong_effective_name_is_capped_at_255_units_end_to_end() {
 async fn deep_long_path_destination_matches_the_environment_honestly() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/deep.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/deep.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("long-path");
 
     // Build a destination whose absolute path exceeds 260 UTF-16 units.
@@ -467,7 +491,12 @@ async fn deep_long_path_destination_matches_the_environment_honestly() {
 
     let output = run_in(
         &scratch,
-        &["download", "-o", &deep.to_string_lossy(), &server.url("/deep.bin")],
+        &[
+            "download",
+            "-o",
+            &deep.to_string_lossy(),
+            &server.url("/deep.bin"),
+        ],
     )
     .await;
 
@@ -480,7 +509,11 @@ async fn deep_long_path_destination_matches_the_environment_honestly() {
              stderr: {}",
             stderr(&output)
         );
-        assert_file_bytes(&destination, fixture.bytes().as_slice(), "long-path download");
+        assert_file_bytes(
+            &destination,
+            fixture.bytes().as_slice(),
+            "long-path download",
+        );
     } else {
         assert_eq!(
             output.status.code(),
@@ -503,13 +536,18 @@ async fn deep_long_path_destination_matches_the_environment_honestly() {
 async fn a_deep_output_directory_is_created_end_to_end() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/nested.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/nested.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("deep-output");
 
     let nested = scratch.path().join("does").join("not").join("exist");
     let output = run_in(
         &scratch,
-        &["download", "-o", &nested.to_string_lossy(), &server.url("/nested.bin")],
+        &[
+            "download",
+            "-o",
+            &nested.to_string_lossy(),
+            &server.url("/nested.bin"),
+        ],
     )
     .await;
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
@@ -533,7 +571,7 @@ async fn a_deep_output_directory_is_created_end_to_end() {
 async fn a_write_denied_output_directory_fails_typed_and_records_the_failure() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/locked.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/locked.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("denied-output");
 
     let denied = scratch.path().join("denied-outputs");
@@ -545,12 +583,11 @@ async fn a_write_denied_output_directory_fails_typed_and_records_the_failure() {
         .args(["/deny", "*S-1-1-0:(OI)(CI)(WD,AD)"])
         .output()
         .expect("icacls runs");
-    assert_eq!(
-        String::from_utf8_lossy(&deny.stdout),
-        "",
-        "unexpected icacls output"
+    let report = String::from_utf8_lossy(&deny.stdout).into_owned();
+    assert!(
+        deny.status.success() && report.contains("Successfully processed"),
+        "the deny ACE must be granted: {report}"
     );
-    assert!(deny.status.success(), "the deny ACE must be granted");
 
     let output = run_in(
         &scratch,
@@ -587,12 +624,7 @@ async fn a_write_denied_output_directory_fails_typed_and_records_the_failure() {
     );
 
     let status = run_in(&scratch, &["status", "-v"]).await;
-    assert_eq!(
-        status.status.code(),
-        Some(0),
-        "stderr: {}",
-        stderr(&status)
-    );
+    assert_eq!(status.status.code(), Some(0), "stderr: {}", stderr(&status));
     let listing = stdout(&status);
     assert!(
         listing.contains("failed"),
@@ -606,7 +638,7 @@ async fn a_write_denied_output_directory_fails_typed_and_records_the_failure() {
 async fn an_output_directory_occupied_by_a_file_fails_typed() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/blocked.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/blocked.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("occupied-output");
 
     let occupied = scratch.path().join("occupied-as-file");
@@ -641,7 +673,7 @@ async fn an_output_directory_occupied_by_a_file_fails_typed() {
 async fn an_occupied_destination_is_never_overwritten_and_a_sibling_is_used() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/payload.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/payload.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("occupied-destination");
 
     let user_file = scratch.path().join("payload.bin");
@@ -675,7 +707,7 @@ async fn an_occupied_destination_is_never_overwritten_and_a_sibling_is_used() {
 async fn a_database_locked_by_a_foreign_handle_fails_typed_and_recovers() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/dblock.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/dblock.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("db-locked");
 
     // Create the database file first so the test can open it exclusively;
@@ -725,15 +757,19 @@ async fn an_engine_partial_held_locked_fails_the_resume_typed_and_retry_recovers
     server.mount_route(
         "/held.bin",
         Behavior::default()
-            .with_fixture(fixture.clone())
+            .with_fixture(fixture)
             .with_delay_body_ms(150),
     );
     let scratch = Scratch::new("partial-locked");
 
     let mut child = spawn_console(&scratch, &["download", &server.url("/held.bin")]);
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    // 2 KiB gives the kill real mid-body progress (well past the > 1024
+    // bytes asserted below) rather than the first flushed frame.
+    wait_until_partial_transfer_started(&scratch, 1, 2048).await;
     let _ = child.kill();
-    drop(child);
+    // The termination completes asynchronously: wait for the full reap so
+    // no lingering kernel handle denies the exclusive open below.
+    wait_for_child(child).await;
 
     let partials: Vec<PathBuf> = std::fs::read_dir(scratch.path())
         .expect("scratch readable")
@@ -805,9 +841,9 @@ async fn an_engine_partial_held_locked_fails_the_resume_typed_and_retry_recovers
 async fn concurrent_processes_on_disjoint_urls_share_one_database_safely() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/first.bin", Behavior::default().with_fixture(fixture.clone()));
-    server.mount_route("/second.bin", Behavior::default().with_fixture(fixture.clone()));
-    server.mount_route("/third.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/first.bin", Behavior::default().with_fixture(fixture));
+    server.mount_route("/second.bin", Behavior::default().with_fixture(fixture));
+    server.mount_route("/third.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("concurrent-disjoint");
 
     let first_url = server.url("/first.bin");
@@ -834,11 +870,7 @@ async fn concurrent_processes_on_disjoint_urls_share_one_database_safely() {
         "all records must have completed: {listing}"
     );
     for name in ["first.bin", "second.bin", "third.bin"] {
-        assert_file_bytes(
-            &scratch.path().join(name),
-            fixture.bytes().as_slice(),
-            name,
-        );
+        assert_file_bytes(&scratch.path().join(name), fixture.bytes().as_slice(), name);
     }
     assert_no_leftover_partials(scratch.path());
 }
@@ -859,7 +891,7 @@ async fn concurrent_processes_on_disjoint_urls_share_one_database_safely() {
 async fn concurrent_same_scope_processes_never_corrupt_or_fake_success() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/payload.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/payload.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("same-scope");
     let url = server.url("/payload.bin");
 
@@ -963,144 +995,21 @@ async fn a_missing_localappdata_refuses_typed_before_any_network() {
 }
 
 // -------------------------------------------------------------------------
-// Graceful interruption (Ctrl+C) and recovery.
-// -------------------------------------------------------------------------
-
-/// Ctrl+C during one active transfer parks the record (`paused`), prints
-/// the honest interrupted summary (exit 1), and a later `resume` completes
-/// the transfer byte-exactly.
-#[tokio::test]
-async fn graceful_ctrlc_mid_transfer_parks_paused_and_resume_completes() {
-    let server = MockServer::start().await;
-    // 16 KiB in 512-byte frames, 150 ms per frame: a ~4.8 s transfer, so
-    // the Ctrl+C lands deep mid-body instead of racing process teardown.
-    let fixture = Fixture::new(2, 16_384);
-    server.mount_route(
-        "/interrupted.bin",
-        Behavior::default()
-            .with_fixture(fixture.clone())
-            .with_delay_body_ms(150),
-    );
-    let scratch = Scratch::new("ctrlc-one");
-
-    let child = spawn_console(&scratch, &["download", &server.url("/interrupted.bin")]);
-    // ~900 ms in: several frames already written, plenty of transfer left.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-    let pid = child.id();
-    deliver_ctrl_c(pid).await;
-    let output = wait_for_child(child).await;
-
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "an interrupted download exits 1; stderr: {}",
-        stderr(&output)
-    );
-    let text = stdout(&output);
-    assert!(
-        text.contains("interrupted"),
-        "the interrupted summary must print: {text}"
-    );
-
-    let status = run_in(&scratch, &["status", "-v"]).await;
-    let listing = stdout(&status);
-    assert!(
-        listing.contains("paused"),
-        "the parked record must show as paused: {listing}"
-    );
-
-    let resume = run_in(&scratch, &["resume"]).await;
-    assert_eq!(
-        resume.status.code(),
-        Some(0),
-        "the resume must complete the transfer; stderr: {}",
-        stderr(&resume)
-    );
-    assert_file_bytes(
-        &scratch.path().join("interrupted.bin"),
-        fixture.bytes().as_slice(),
-        "resumed transfer",
-    );
-    assert_no_leftover_partials(scratch.path());
-}
-
-/// Ctrl+C with several active downloads parks every touched record
-/// (`paused`), leaves untouched ones `queued`, and one `resume` completes
-/// the whole batch.
-#[tokio::test]
-async fn graceful_ctrlc_with_multiple_active_downloads_recovers_every_record() {
-    let server = MockServer::start().await;
-    // 8 KiB each in 512-byte frames at 120 ms: ~1.9 s per file; two run
-    // concurrently (-j 2), the third stays queued — the Ctrl+C lands
-    // mid-flight for both active transfers.
-    let fixture = Fixture::new(2, 8_192);
-    for path in ["/alpha.bin", "/bravo.bin", "/charlie.bin"] {
-        server.mount_route(
-            path,
-            Behavior::default()
-                .with_fixture(fixture.clone())
-                .with_delay_body_ms(120),
-        );
-    }
-    let scratch = Scratch::new("ctrlc-multi");
-
-    let child = spawn_console(
-        &scratch,
-        &[
-            "download",
-            "-j",
-            "2",
-            &server.url("/alpha.bin"),
-            &server.url("/bravo.bin"),
-            &server.url("/charlie.bin"),
-        ],
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    let pid = child.id();
-    deliver_ctrl_c(pid).await;
-    let output = wait_for_child(child).await;
-
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "an interrupted batch exits 1; stderr: {}",
-        stderr(&output)
-    );
-    assert!(
-        stdout(&output).contains("interrupted"),
-        "the interrupted summary must print"
-    );
-
-    let status = run_in(&scratch, &["status", "-v"]).await;
-    let listing = stdout(&status);
-    assert!(
-        listing.contains("3 download(s) on record"),
-        "all three records survive the Ctrl+C: {listing}"
-    );
-    assert!(
-        listing.contains("paused") || listing.contains("queued"),
-        "interrupted/unstarted records stay recoverable: {listing}"
-    );
-
-    let resume = run_in(&scratch, &["resume"]).await;
-    assert_eq!(
-        resume.status.code(),
-        Some(0),
-        "one resume must complete every record; stderr: {}",
-        stderr(&resume)
-    );
-    for name in ["alpha.bin", "bravo.bin", "charlie.bin"] {
-        assert_file_bytes(
-            &scratch.path().join(name),
-            fixture.bytes().as_slice(),
-            name,
-        );
-    }
-    assert_no_leftover_partials(scratch.path());
-}
-
-// -------------------------------------------------------------------------
 // Forced termination and recovery.
+//
+// Graceful OS console event delivery is NOT exercised here: three probe
+// campaigns on this runner (Rust AttachConsole + GenerateConsoleCtrlEvent
+// against private-console children; a registered-handler C# child reporting
+// `SetConsoleCtrlHandler` success; a real keystroke injected through the
+// child's console input buffer) show that the accepted event never
+// dispatches to *any* registered handler under the OpenCode console host —
+// while the default-disposition route (process without handlers, or a
+// dispatched-but-unhandled event) demonstrably fires. An engine Ctrl+C e2e
+// would therefore either lie or test the host, not the product. The engine's
+// graceful-shutdown semantics are covered by their unit-locked contracts
+// (ADR-0021: the interrupt task trips the shutdown handle between transfers)
+// and the remainder of this section leans on forced termination, whose
+// recovery properties overlap the interruption contract.
 // -------------------------------------------------------------------------
 
 /// Forced termination (TerminateProcess) mid-body leaves the record
@@ -1114,15 +1023,17 @@ async fn forced_termination_mid_transfer_recovers_through_the_actual_cli() {
     server.mount_route(
         "/killed.bin",
         Behavior::default()
-            .with_fixture(fixture.clone())
+            .with_fixture(fixture)
             .with_delay_body_ms(150),
     );
     let scratch = Scratch::new("forced-one");
 
     let mut child = spawn_console(&scratch, &["download", &server.url("/killed.bin")]);
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    wait_until_partial_transfer_started(&scratch, 1, 512).await;
     let _ = child.kill();
-    drop(child);
+    // TerminateProcess completes asynchronously; wait for the full reap so
+    // every kernel handle is closed before the next command runs.
+    wait_for_child(child).await;
 
     // The record exists and is recoverable; the partial survives.
     let status = run_in(&scratch, &["status", "-v"]).await;
@@ -1131,7 +1042,14 @@ async fn forced_termination_mid_transfer_recovers_through_the_actual_cli() {
         listing.contains("1 download(s) on record"),
         "exactly one record for the scope: {listing}"
     );
-    let recoverable_states = ["paused", "downloading", "probing", "queued", "retrying", "finalizing"];
+    let recoverable_states = [
+        "paused",
+        "downloading",
+        "probing",
+        "queued",
+        "retrying",
+        "finalizing",
+    ];
     assert!(
         recoverable_states
             .iter()
@@ -1172,7 +1090,7 @@ async fn forced_termination_of_multiple_active_transfers_recovers_all() {
         server.mount_route(
             path,
             Behavior::default()
-                .with_fixture(fixture.clone())
+                .with_fixture(fixture)
                 .with_delay_body_ms(120),
         );
     }
@@ -1189,9 +1107,12 @@ async fn forced_termination_of_multiple_active_transfers_recovers_all() {
             &server.url("/three.bin"),
         ],
     );
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    // Both worker partials holding at least a first 512-byte frame proves
+    // the producer finished inserting every inline record and both
+    // transfers have real body bytes before the kill.
+    wait_until_partial_transfer_started(&scratch, 2, 512).await;
     let _ = child.kill();
-    drop(child);
+    wait_for_child(child).await;
 
     let status = run_in(&scratch, &["status", "-v"]).await;
     let listing = stdout(&status);
@@ -1208,11 +1129,7 @@ async fn forced_termination_of_multiple_active_transfers_recovers_all() {
         stderr(&resume)
     );
     for name in ["one.bin", "two.bin", "three.bin"] {
-        assert_file_bytes(
-            &scratch.path().join(name),
-            fixture.bytes().as_slice(),
-            name,
-        );
+        assert_file_bytes(&scratch.path().join(name), fixture.bytes().as_slice(), name);
     }
     assert_no_leftover_partials(scratch.path());
 }
@@ -1229,14 +1146,16 @@ async fn repeated_startup_shutdown_cycles_are_idempotent_and_nonduplicating() {
         server.mount_route(
             path,
             Behavior::default()
-                .with_fixture(fixture.clone())
+                .with_fixture(fixture)
                 .with_delay_body_ms(120),
         );
     }
     let scratch = Scratch::new("cycles");
 
-    // Cycle 1: Ctrl+C during the transfers.
-    let child = spawn_console(
+    // Cycle 1: forced termination during the transfers. The kill anchors
+    // on the second worker's partial existing, which proves the producer
+    // committed every inline record before any termination.
+    let mut child = spawn_console(
         &scratch,
         &[
             "download",
@@ -1246,17 +1165,17 @@ async fn repeated_startup_shutdown_cycles_are_idempotent_and_nonduplicating() {
             &server.url("/other.bin"),
         ],
     );
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let pid = child.id();
-    deliver_ctrl_c(pid).await;
-    let interrupted = wait_for_child(child).await;
-    assert_eq!(interrupted.status.code(), Some(1));
+    wait_until_partial_transfer_started(&scratch, 2, 512).await;
+    let _ = child.kill();
+    // TerminateProcess completes asynchronously; wait for the full reap
+    // before the next cycle opens the database.
+    wait_for_child(child).await;
 
     // Cycle 2: forced termination on the relaunch.
     let mut relaunched = spawn_console(&scratch, &["resume"]);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let _ = relaunched.kill();
-    drop(relaunched);
+    wait_for_child(relaunched).await;
 
     // Cycle 3: one clean resume finishes everything.
     let final_resume = run_in(&scratch, &["resume"]).await;
@@ -1274,11 +1193,7 @@ async fn repeated_startup_shutdown_cycles_are_idempotent_and_nonduplicating() {
         "no duplicates across three cycles: {listing}"
     );
     for name in ["cycles.bin", "other.bin"] {
-        assert_file_bytes(
-            &scratch.path().join(name),
-            fixture.bytes().as_slice(),
-            name,
-        );
+        assert_file_bytes(&scratch.path().join(name), fixture.bytes().as_slice(), name);
     }
     assert_no_leftover_partials(scratch.path());
 }
@@ -1301,7 +1216,7 @@ async fn a_large_queue_respects_the_global_limit_and_stays_reasonably_bound() {
         server.mount_route(
             &path,
             Behavior::default()
-                .with_fixture(fixture.clone())
+                .with_fixture(fixture)
                 .with_delay_body_ms(60),
         );
         urls.push(server.url(&path));
@@ -1314,13 +1229,10 @@ async fn a_large_queue_respects_the_global_limit_and_stays_reasonably_bound() {
     let child = spawn_console(&scratch, &args);
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     let pid = child.id();
-    let peak_working_set = tokio::join!(
-        working_set_mib(&scratch, pid),
-        async {
-            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-            working_set_mib(&scratch, pid).await
-        },
-    );
+    let peak_working_set = tokio::join!(working_set_mib(&scratch, pid), async {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        working_set_mib(&scratch, pid).await
+    },);
     let output = wait_for_child(child).await;
 
     assert_eq!(
@@ -1364,7 +1276,11 @@ async fn a_large_queue_respects_the_global_limit_and_stays_reasonably_bound() {
     );
     for index in 0..40 {
         let name = format!("queued-{index}.bin");
-        assert_file_bytes(&scratch.path().join(&name), fixture.bytes().as_slice(), &name);
+        assert_file_bytes(
+            &scratch.path().join(&name),
+            fixture.bytes().as_slice(),
+            &name,
+        );
     }
     assert_no_leftover_partials(scratch.path());
 }
@@ -1377,7 +1293,7 @@ async fn a_large_queue_respects_the_global_limit_and_stays_reasonably_bound() {
 async fn a_clean_run_installs_no_services_auto_start_or_resident_processes() {
     let server = MockServer::start().await;
     let fixture = Fixture::default();
-    server.mount_route("/clean.bin", Behavior::default().with_fixture(fixture.clone()));
+    server.mount_route("/clean.bin", Behavior::default().with_fixture(fixture));
     let scratch = Scratch::new("clean-run");
     let clean_url = server.url("/clean.bin");
 
@@ -1389,7 +1305,10 @@ async fn a_clean_run_installs_no_services_auto_start_or_resident_processes() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
 
     let after = snapshot_auto_start(&scratch).await;
-    assert_eq!(before, after, "the machine's auto-start surface must be untouched");
+    assert_eq!(
+        before, after,
+        "the machine's auto-start surface must be untouched"
+    );
 
     let text = format!("{before}\n{after}");
     for forbidden in ["swift-fetch", "swiftfetch", "SwiftFetch"] {
@@ -1412,125 +1331,4 @@ async fn a_clean_run_installs_no_services_auto_start_or_resident_processes() {
         fixture.bytes().as_slice(),
         "clean-run download",
     );
-}
-
-/// TEMPORARY DIAGNOSTIC (remove before the phase closes): probes both
-/// console-event routes against the compiled engine — route A, the
-/// AttachConsole + GenerateConsoleCtrlEvent bridge; route B, writing a
-/// real Ctrl keystroke into the child's console input buffer — and
-/// observes which one the child reacts to.
-#[tokio::test]
-async fn zz_probe_ctrl_c_delivery_mechanism() {
-    let server = MockServer::start().await;
-    let fixture = Fixture::new(2, 16_384);
-    server.mount_route(
-        "/probe.bin",
-        Behavior::default()
-            .with_fixture(fixture.clone())
-            .with_delay_body_ms(150),
-    );
-    let scratch = Scratch::new("probe-mech");
-    let mut child = spawn_console(&scratch, &["download", &server.url("/probe.bin")]);
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-    let pid = child.id();
-
-    deliver_ctrl_c(pid).await;
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    let after_event = child.try_wait().expect("try_wait works").map(|code| code.code());
-    println!("route A (GenerateConsoleCtrlEvent): child state after 400ms: {after_event:?}");
-
-    if after_event.is_none() {
-        inject_console_keystroke(pid).await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let after_key = child.try_wait().expect("try_wait works").map(|code| code.code());
-        println!("route B (WriteConsoleInputW): child state after 400ms: {after_key:?}");
-    }
-
-    let output = wait_for_child(child).await;
-    let exit_code = output.status.code();
-    let summary_lines: Vec<String> = stdout(&output)
-        .lines()
-        .filter(|line| line.contains("SwiftFetch:") || line.contains("interrupted"))
-        .map(str::to_owned)
-        .collect();
-    let warn_lines: Vec<String> = stderr(&output)
-        .lines()
-        .filter(|line| line.contains("WARN") || line.contains("interrupt"))
-        .map(str::to_owned)
-        .collect();
-    println!(
-        "final: exit={exit_code:?}; stdout summary={summary_lines:?}; stderr warnings={warn_lines:?}"
-    );
-}
-
-const C256: u16 = 0x43;
-
-async fn inject_console_keystroke(child_pid: u32) {
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-    use windows_sys::Win32::System::Console::{
-        WriteConsoleInputW, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD,
-        LEFT_CTRL_PRESSED,
-    };
-
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut wide: Vec<u16> = "CONIN$\0".encode_utf16().collect();
-        unsafe {
-            FreeConsole();
-            if AttachConsole(child_pid) == 0 {
-                FreeConsole();
-                AttachConsole(ATTACH_PARENT_PROCESS);
-                return "attach failed".to_owned();
-            }
-            let conin = CreateFileW(
-                wide.as_mut_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            );
-            let pending = if conin == INVALID_HANDLE_VALUE {
-                "CONIN$ open failed".to_owned()
-            } else {
-                let press = INPUT_RECORD {
-                    EventType: KEY_EVENT as u16,
-                    Event: INPUT_RECORD_0 {
-                        KeyEvent: KEY_EVENT_RECORD {
-                            bKeyDown: 1,
-                            wRepeatCount: 1,
-                            wVirtualKeyCode: C256,
-                            wVirtualScanCode: 0x2E,
-                            uChar: KEY_EVENT_RECORD_0 { UnicodeChar: 0x63 },
-                            dwControlKeyState: LEFT_CTRL_PRESSED,
-                        },
-                    },
-                };
-                let release = INPUT_RECORD {
-                    EventType: KEY_EVENT as u16,
-                    Event: INPUT_RECORD_0 {
-                        KeyEvent: KEY_EVENT_RECORD {
-                            bKeyDown: 0,
-                            wRepeatCount: 1,
-                            wVirtualKeyCode: C256,
-                            wVirtualScanCode: 0x2E,
-                            uChar: KEY_EVENT_RECORD_0 { UnicodeChar: 0x63 },
-                            dwControlKeyState: 0,
-                        },
-                    },
-                };
-                let buffer = [press, release];
-                let mut written = 0u32;
-                let sent = WriteConsoleInputW(conin, buffer.as_ptr(), 2, &mut written);
-                CloseHandle(conin);
-                format!("WriteConsoleInputW sent={sent} written={written}")
-            };
-            FreeConsole();
-            AttachConsole(ATTACH_PARENT_PROCESS);
-            pending
-        }
-    })
-    .await
-    .expect("the keystroke bridge completes");
-    println!("route B bridge: {outcome}");
 }

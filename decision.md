@@ -1645,6 +1645,177 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 | ID | Title | Status |
 |---|---|---|
 | ADR-0023 | Phase 11 command wiring: services-only dispatch, the database-location override, the pre-documented `failed → queued` retry edge, and the exit-code mapping | Accepted |
+| ADR-0024 | Phase 12 Windows hardening: the `windows-sys` test-only orchestrator, milestone-anchored kills, the console-delivery disclosure, and the two engine hardenings its tests found | Accepted |
+
+## ADR-0024 - Phase 12 Windows resilience and failure hardening: the `windows-sys` test-only orchestrator, milestone-anchored forced termination, the console-delivery disclosure, and the two engine hardenings its tests found
+
+- **Status:** Accepted
+- **Date:** 2026-10-20
+- **Context:** Phase 12 is a verify-and-harden phase, run natively on
+  Windows against the local mock server only. Constraints from the
+  phase spec and the house rules: Windows-specific behavior must be
+  tested on Windows, not assumed; a test that cannot claim honest
+  evidence must not exist (repeat what you ran, disclose what you
+  could not simulate); test-only dependencies must never enter the
+  product binary (ADR-0013 discipline, ADR-0003 first-use rule);
+  tests may never be weakened, skipped, or "fixed" by assertion
+  deletion - real engine defects found by tests are fixed in typed
+  code together with the tests that found them; and the canonical
+  recipe (`cargo fmt --check`, clippy `-D warnings`, plain
+  `cargo build`, `cargo test`) is the gate. The engine children drive
+  real OS surface: exclusive handles, permission ACEs, long paths,
+  console sessions, `TerminateProcess`.
+- **Decision:**
+  1. **Test-only `windows-sys 0.61.2` orchestrator.** The new
+     `tests/windows.rs` harness needs exactly two native capabilities
+     the standard library cannot express: the real Windows
+     "file locked" state (a share-mode-0 `CreateFileW` handle held by
+     a `Drop`-closing `ExclusiveLock`, for the locked-partials and
+     locked-database tests), and - during its diagnostic probes only -
+     console P/Invoke (`AttachConsole`/`FreeConsole`,
+     `GenerateConsoleCtrlEvent`, `WriteConsoleInputW`). The crate is
+     `[dev-dependencies]`-only with per-feature enablement
+     (`Win32_Foundation`, `Win32_Storage_FileSystem`); the console
+     feature was trimmed again once the delivery route was dropped.
+     It is never linked into the product binary; the recipe's plain
+     `cargo build` re-locks that boundary every run.
+  2. **Milestone-anchored kills instead of clock-based kills.** Under
+     a parallel test load, a kill fired on a *clock* is unprovable:
+     probes recorded a +600 ms forced termination landing on an
+     engine that had not committed a single record yet, which then
+     made downstream assertions fail for reasons unrelated to the
+     recovery contract. Law: every kill-based test first waits - via
+     `wait_until_partial_transfer_started` - for `expected` engine
+     partial files不低于 `min_partial_bytes` in the scratch, then
+     `TerminateProcess`es. The partial's existence is downstream of
+     the persistent record insert (the engine writes no network byte
+     before its record), so the milestone *proves* the record
+     committed while anchoring the kill in real engine progress.
+     Sizes are read through an *open handle* ("data-open read"),
+     because directory-cached metadata (`DirEntry::metadata`)
+     indefinitely reports length 0 on Windows for a file another
+     process actively writes - an observed fact, not folklore, and
+     worth pinning for future hardening work.
+  3. **Full-reap after every kill.** `TerminateProcess` completes
+     asynchronously; each kill is followed by a `wait()` before the
+     next child spawn or file assertion. Observed necessity: an
+     exclusive-open asserting "locked" ran into a still-terminating
+     child that held the partial open (os error 32 before the test's
+     own lock existed).
+  4. **Console-event delivery disclosure.** Three probe campaigns on
+     this runner - (a) an in-process `AttachConsole` +
+     `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` bridge against a
+     private-console child, (b) a registered-handler C# child that
+     reports its own `SetConsoleCtrlHandler` result, and (c) a real
+     keystroke injected into the child console's input buffer via
+     `WriteConsoleInputW` - established, with every step's result
+     visible, that the accepted console event never dispatches to
+     *any* registered handler in this environment: registration
+     reports success (`REGISTER-OK=True LastErr=0`), event calls
+     return success, and yet no handler ever runs, while the default
+     disposition route demonstrably fires (children die
+     `STATUS_CONTROL_C_EXIT` exactly when the event is unhandled).
+     The probe child *without* extra handlers died on the event the
+     same way default disposition predicts, so this is not an engine
+     defect and not a probe bug - it is a property of the runner's
+     console host chain. Per the phase spec's explicit allowance,
+     the graceful Ctrl+C e2e was therefore **not** shipped here and
+     its non-simulability is disclosed in the Phase 12 entry; the
+     engine's graceful-shutdown semantics stay covered by their
+     unit-locked contract (the interrupt task trips the shutdown
+     handle - the Phase 11 wiring is unchanged and was reviewed, not
+     modified), and the recoverability-intersection of Ctrl+C
+     (interrupted records recoverable through the real CLI) is
+     covered by the forced-termination suite this phase does ship.
+  5. **The two engine hardenings the phase's own tests found.** Both
+     were fixed in typed code together with the tests that caught
+     them; neither test was aligned to the old behavior.
+     a. `reconcile_download` now calls `ensure_output_dir(dir)`
+        before `scan_partials`. Before: `-o <never-created nested
+        path>` failed typed with "the output directory ... could not
+        be read to look for previous transfers' partial files:
+        os error 3" - the engine refused a destination it is allowed
+        to create, because the recovery scan ran before the creation
+        the attempt would have performed anyway. After: a fresh
+        nested destination is created on demand (same contract as
+        `PartialFile::create`/`reserve_destination`), while true
+        filesystem failures (access-denied, occupied-by-file) still
+        propagate typed, and the e2e locks both behaviors.
+     b. `PartialFile::create` re-caps the stem against the engine
+        namespace suffix (`cap_units(name, suffix_utf16_units)`)
+        before appending `.swiftfetch-<pid>-<seq>.part`. Before: a
+        final name that used the full 255-UTF-16 component budget
+        (the naming contract's own cap) produced partial names ~280
+        units long - a component limit violation that fails *creation*
+        outright, so files with near-limit names could never be
+        downloaded at all (long paths widen the total path, never the
+        per-component limit) - surfaced by the overlong-name e2e.
+        After: creation succeeds for names up to the legal budget.
+        Disclosed cost: recovery finds prior partials by the
+        `{file_name}.swiftfetch-` prefix, so a capped partial no
+        longer prefix-matches an overlong name after a crash and the
+        transfer restarts from zero - a full, honest restart, no
+        corruption, and strictly better than the previous impossible
+        download.
+  6. **Access-denied is stated as a deny-ACE, not the read-only
+     attribute.** Windows ignores the read-only *attribute* on
+     directories, so a "readonly dir" test would exercise nothing.
+     The suite grants `icacls /deny *S-1-1-0:(OI)(CI)(WD,AD)` on the
+     output subtree, asserts the typed failure and the `failed`
+     record, and releases with `/remove:d` - the well-known SID keeps
+     it locale- and account-independent. The engine must not create
+     false completion, and the e2e locks the typed failure path.
+- **Consequences:**
+  - `tests/windows.rs` (24 tests) is the phase's primary deliverable
+    and runs natively: reserved stems, illegal-character sanitizing,
+    the 255-unit cap deep end-to-end, deep path branches per the
+    machine's `LongPathsEnabled`, access-denied, occupied outputs and
+    siblings, locked partials and databases, deep-output creation,
+    per-interruption recovery (single, multi, repeated cycles -
+    all milestone-anchored), concurrency inside one scope and across
+    scopes, the bounded large queue with mock-observed concurrency
+    and a working-set probe, and the clean-install surface (no
+    services, no Run keys, no schtasks, no resident process, typed
+    refusal with missing `LOCALAPPDATA`).
+  - Environment limitations are recorded in the phase entry rather
+    than simulated: true disk-full, cross-volume finalization
+    (impossible by construction in this harness), the sub-millisecond
+    kill-inside-rename window, the graceful console-event delivery
+    (item 4), and the cross-process same-scope first-submission
+    insert race (no `UNIQUE(url, destination)` constraint; a
+    single-user product assumption that a later ADR would have to
+    own if the boundary moves).
+  - The kill-milestone helper makes kills *evidence-driven*: it fails
+    loudly ("never reached ... partial file(s)") instead of letting
+    a load-slowed child silently pass assertions that never had a
+    mid-transfer point.
+- **Rejected alternatives:**
+  1. Ship a graceful-Ctrl+C e2e that "passes" by injecting events
+     regardless of dispatch - rejected: it would test the probe
+     harness, not the engine, and the pass/fail would flip with the
+     runner rather than the product.
+  2. Fix the cross-process first-submission race now with a
+     `UNIQUE(url, destination)` index - rejected for this phase: it
+     needs a migration and an adopt-order policy for duplicate
+     inserts (which record owns the scope) that belong in a prepared
+     owner decision, not a hardening sweep.
+  3. Shorten the engine suffix (e.g. `.p`) instead of capping the
+     stem - rejected: the suffix *is* the ADR-0016 namespace contract
+     (`<name>.swiftfetch-<pid>-<seq>.part`); the stem shrinks, the
+     namespace stays.
+  4. Simulate access-denied via the read-only attribute - rejected:
+     Windows ignores that bit on directories, so the test would
+     exercise a no-op, not an access-denied failure.
+  5. Keep the console feature on the dev-dep "just in case" -
+     rejected: per-feature first-use discipline (ADR-0003) applies to
+     test deps too; the dead feature was trimmed once the discovery
+     phase concluded.
+- **Related:** ADR-0003 (dependency first-use), ADR-0013 (test-only
+  dependency discipline), ADR-0016 (naming/finalization contract the
+  partial cap extends), ADR-0020 (record-before-first-byte law that
+  the kill milestone observes), ADR-0021 (the shutdown contract the
+  console-delivery disclosure leans on), `DOCS/phases.md` Phase 12,
+  `changes.md` Phase 12 entry.
 
 
 
