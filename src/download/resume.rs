@@ -3299,7 +3299,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "the finalized file is byte-exact"
         );
         assert_eq!(download.file_name, "plain-flow.bin");
@@ -3373,7 +3373,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "the restarted content is byte-exact with no appended prefix"
         );
         assert!(
@@ -3440,7 +3440,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "the restarted content is byte-exact with no appended prefix"
         );
         assert!(
@@ -3566,7 +3566,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "prefix + appended remainder is byte-exact"
         );
         assert_eq!(download.file_name, "resume-target.bin");
@@ -3626,7 +3626,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "the restarted content is byte-exact; the lying 206 was never trusted"
         );
         assert!(
@@ -3658,7 +3658,7 @@ mod tests {
         stage_partial(
             scratch.path(),
             "finalize-now.bin",
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
         );
 
         let download = drive(&repo, &server, "/finalize-now.bin", scratch.path(), 5)
@@ -3669,7 +3669,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         assert_eq!(
             server.route_hits("/finalize-now.bin"),
@@ -3700,7 +3700,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         let record = repo
             .get_download(repo.list_downloads().expect("list")[0].id)
@@ -3931,7 +3931,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
     }
 
@@ -3965,7 +3965,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         assert_eq!(
             if_range_header(&server, "/unvalidated.bin"),
@@ -4083,7 +4083,7 @@ mod tests {
             std::fs::read(dir.join("pinned-partial.bin"))
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
     }
 
@@ -4243,7 +4243,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "segmented output is byte-identical to the source"
         );
 
@@ -4314,7 +4314,7 @@ mod tests {
                 std::fs::read(&download.destination)
                     .expect("final file")
                     .as_slice(),
-                (&*fixture.bytes()).as_slice()
+                (*fixture.bytes()).as_slice()
             );
             let rows = sole_rows(&repo);
             assert_eq!(
@@ -4352,7 +4352,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
 
         let peak = server.peak_active_gets();
@@ -4391,7 +4391,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         assert_eq!(
             ranged_values(&server, "/small.bin"),
@@ -4433,7 +4433,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         assert_eq!(
             ranged_values(&server, "/unknown-size.bin"),
@@ -4465,7 +4465,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "the sequential fallback is byte-exact"
         );
         assert_eq!(
@@ -4508,7 +4508,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice(),
+            (*fixture.bytes()).as_slice(),
             "a lying Content-Range never becomes file content"
         );
         assert_eq!(unranged_gets(&server, "/broken-range.bin"), 1);
@@ -4606,7 +4606,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         let record = repo
             .get_download(repo.list_downloads().expect("list")[0].id)
@@ -4729,7 +4729,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
         let rows = sole_rows(&repo);
         assert!(
@@ -4866,7 +4866,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
 
         // Verify segment states: all should be Completed
@@ -4942,7 +4942,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
     }
 
@@ -5018,7 +5018,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
     }
 
@@ -5467,7 +5467,7 @@ mod tests {
         );
 
         // Stage partial with first segment only
-        stage_partial_with_content(&dir, "seg-failed.bin", &fixture.slice(0, 10921));
+        stage_partial_with_content(&dir, "seg-failed.bin", fixture.slice(0, 10921));
 
         // Recovery should fetch both the Failed and Pending segments
         let download = drive(&repo, &server, "/seg-failed.bin", &dir, 0)
@@ -5496,7 +5496,7 @@ mod tests {
             std::fs::read(&download.destination)
                 .expect("final file")
                 .as_slice(),
-            (&*fixture.bytes()).as_slice()
+            (*fixture.bytes()).as_slice()
         );
     }
 
