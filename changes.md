@@ -1488,6 +1488,34 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
     and the fresh-clone gate results land in the post-commit addendum
     below.
 
+### Phase 8 verification addendum (post-commit, appended 2026-10-19)
+
+- **Commit:** `7626e03` - "Phase 8: Segmented downloads (v0.10.0)" (code
+  + tests + tracking files, 12 files changed, 2858 insertions(+),
+  69 deletions(-), including the new `src/download/segmented.rs`). The
+  phase entry above is part of that commit, so the hash is recorded here
+  and in `git log`, not inside the entry itself (same honesty rule as
+  the earlier phase entries).
+- **Fresh-clone gate reproduction** (ADR-0008 recipe: `git clone` of
+  `7626e03` to a fresh temp directory on Windows - MSVC, rustc 1.99.1 -
+  the clone was removed after the run; `git status --porcelain` was
+  empty at commit time; run in order):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, 0 warnings (fresh uncached `target/`, 33.3 s check) |
+| `cargo test` | 289 passed, 0 failed (233 unit + 11 cli + 15 fixtures + 30 mock_server), identical to the working-tree run (unit target 155.2 s cold; cli 2.0 s, fixtures 0.0 s, mock_server 2.0 s) |
+
+- The fresh clone reports the same per-target pass counts the
+  pre-commit working-tree gate observed (233 / 11 / 15 / 30 = 289), so
+  every committed file passed the canonical recipe from a clean
+  checkout.
+- The Phase 7 addendum gap disclosed in the Phase 8 entry is not
+  backfilled here (ADR-0010 forbids rewriting history; a retroactive
+  "post-commit" record would be fabricated evidence); this addendum
+  records only its own commit hash and fresh-clone results.
+
 
 
 
