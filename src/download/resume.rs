@@ -63,8 +63,9 @@ use crate::download::sequential::{
 use crate::error::{AppError, ErrorCategory};
 use crate::logging::redact_url;
 use crate::storage::file_writer::{finalize, reserve_destination, PartialFile};
+use crate::archive::{extract_zip, ExtractionConfig, ExtractionOutcome};
 use crate::storage::repository::{
-    DownloadRecord, DownloadState, NewDownload, NewSegment, Repository, SegmentRecord,
+    DownloadRecord, DownloadState, NewDownload, NewSegment, NewExtraction, Repository, SegmentRecord,
     SegmentState, TransferFacts,
 };
 
@@ -309,6 +310,7 @@ struct Attempt<'a> {
     progress: Arc<Progress>,
     shutdown: &'a ShutdownHandle,
     segmentation: &'a SegmentationPolicy,
+    zip_auto_extract: bool,
     now: fn() -> u64,
 }
 
@@ -528,6 +530,7 @@ pub(crate) async fn transfer_persisted(
     segmentation: &SegmentationPolicy,
     now: fn() -> u64,
     shutdown: &ShutdownHandle,
+    zip_auto_extract: bool,
 ) -> Result<SequentialDownload, AppError> {
     let ctx = Attempt {
         client,
@@ -537,6 +540,7 @@ pub(crate) async fn transfer_persisted(
         progress,
         shutdown,
         segmentation,
+        zip_auto_extract,
         now,
     };
     let mut transient_failures: u32 = 0;
@@ -2455,8 +2459,40 @@ async fn finalize_claimed(
     ctx.repo
         .update_status(record_id, DownloadState::Completed, (ctx.now)(), None)?;
     tracing::info!("download {record_id}: finalized at {}", moved.display());
-    Ok(moved)
-}
+
+    // Trigger ZIP extraction if enabled and the file is a ZIP archive.
+    if ctx.zip_auto_extract && is_zip_file(&moved) {
+        tracing::info!("download {record_id}: starting automatic ZIP extraction for {}", moved.display());
+        let extraction_id = ctx.repo.insert_extraction(
+            record_id,
+            NewExtraction {
+                archive_path: moved.clone(),
+                destination: determine_extract_dir(&moved, &ExtractionConfig::default()),
+            },
+        )?;
+        // Spawn extraction in background to avoid blocking the download completion
+        let repo_clone = ctx.repo.clone();
+        let moved_clone = moved.clone();
+        let zip_auto_extract = ctx.zip_auto_extract;
+        tokio::spawn(async move {
+            let config = ExtractionConfig {
+                auto_extract: zip_auto_extract,
+                extract_dir: None,
+                overwrite_existing: false,
+            };
+            let result = extract_zip(repo_clone, extraction_id, moved_clone, config).await;
+            match result {
+                Ok(outcome) => {
+                    tracing::info!("extraction completed: {} files extracted to {}", outcome.files_extracted, outcome.destination.display());
+                }
+                Err(e) => {
+                    tracing::error!("extraction failed for {}: {}", moved_clone.display(), e);
+                }
+            }
+        });
+        }
+        Ok(moved)
+    }
 
 /// The `FinalizeAvailable` plan's own finishing path (no network work at
 /// all): the file is already complete and confirmed.
@@ -5515,5 +5551,31 @@ mod tests {
             hasher.update(&buffer[..n]);
         }
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Checks if a file is a ZIP archive by reading the magic bytes.
+    fn is_zip_file(path: &Path) -> bool {
+        std::fs::File::open(path)
+            .and_then(|mut file| {
+                use std::io::Read;
+                let mut magic = [0u8; 4];
+                file.read_exact(&mut magic)?;
+                Ok(magic)
+            })
+            .map(|magic| magic == [0x50, 0x4B, 0x03, 0x04] || magic == [0x50, 0x4B, 0x05, 0x06] || magic == [0x50, 0x4B, 0x07, 0x08])
+            .unwrap_or(false)
+    }
+
+    /// Determines the extraction directory for a ZIP archive.
+    fn determine_extract_dir(archive_path: &Path, config: &ExtractionConfig) -> PathBuf {
+        if let Some(dir) = &config.extract_dir {
+            dir.clone()
+        } else {
+            let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+            let stem = archive_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("extracted");
+            parent.join(stem)
+        }
     }
 }

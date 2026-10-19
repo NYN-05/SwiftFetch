@@ -17,6 +17,8 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 # yields bytes::Bytes). reqwest already pulls this crate, so the tree gains
 # nothing new; it only becomes *directly named* by engine code.
 bytes = "1"
+# Phase 10: ZIP extraction library
+zip = "2"
 # Phase 4: the sequential transfer engine is async production code — bounded
 # transfer timeouts (time), partial-file streaming (fs, io-util). Phase 6 adds
 # "sync" for the graceful-shutdown watch channel behind the shutdown handle

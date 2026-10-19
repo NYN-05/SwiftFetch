@@ -194,6 +194,7 @@ pub(crate) async fn run_batch(
         shutdown: shutdown.clone(),
         gauge: Arc::clone(&gauge),
         now,
+        zip_auto_extract: true, // TODO: read from config in Phase 11
     };
     let mut workers = JoinSet::new();
     for _ in 0..worker_count {
@@ -267,6 +268,7 @@ struct WorkerContext {
     shutdown: ShutdownHandle,
     gauge: Arc<ActiveGauge>,
     now: fn() -> u64,
+    zip_auto_extract: bool,
 }
 
 /// The scheduler's own high-water mark of concurrently active transfers.
@@ -337,6 +339,7 @@ async fn worker(
                 &context.segmentation,
                 context.now,
                 &context.shutdown,
+                context.zip_auto_extract,
             )
             .await;
             drop(guard);
