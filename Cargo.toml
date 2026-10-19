@@ -50,3 +50,4 @@ hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client", "http1", "tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+sha2 = "0.10"
