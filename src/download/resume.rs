@@ -5209,8 +5209,8 @@ mod tests {
         );
 
         let mut content = Vec::with_capacity(12288);
-        content.extend_from_slice(&*fixture.slice(0, 8191));
-        content.extend_from_slice(&*fixture.slice(8192, 12287));
+        content.extend_from_slice(&fixture.slice(0, 8191));
+        content.extend_from_slice(&fixture.slice(8192, 12287));
         stage_partial_with_content(&dir, "seg-idempotent.bin", &content);
 
         // First recovery run
