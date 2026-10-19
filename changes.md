@@ -2147,6 +2147,52 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
     the two concurrent-process tests; cross-volume → disclosed
     (item 4).
 
+## Phase 12 verification addendum (post-commit; fresh-clone gate)
+
+- **Phase commit:** `24e1c9f` - "Phase 12: Windows resilience and failure
+  hardening (v0.14.0)", on `main`, parent `2bb4b6e`.
+- **Fresh clone:** `C:\Users\JHASHANK\AppData\Local\Temp\opencode\`
+  `swiftfetch-phase12-clone`, cloned from the working repository at
+  `24e1c9f` (head verified in the clone before the recipe).
+- **Canonical recipe in the fresh clone, cold, 2026-10-20 (observed):**
+  - `cargo fmt --check` - pass, exit 0.
+  - `cargo clippy --all-targets --all-features -- -D warnings` - pass,
+    exit 0 (43.4 s cold; the product deps compiled from scratch).
+  - plain `cargo build` - pass, exit 0 (41.2 s).
+  - `cargo test --no-fail-fast` (132.5 s for the unit target):
+    - unit target: **276 passed / 7 failed** - reproduces the working
+      tree's result set exactly; the failure-name re-confirmation in the
+      clone is recorded below.
+    - `tests/cli.rs`: **24 passed / 0 failed** (6.6 s).
+    - `tests/fixtures.rs`: **15 passed / 0 failed** (0.01 s).
+    - `tests/mock_server.rs`: **33 passed / 0 failed** (2.1 s).
+    - `tests/windows.rs`: **24 passed / 0 failed** (6.0 s) - the phase's
+      own target passes in a from-scratch clone with no shared state:
+      per-scratch temp directories, per-scratch SQLite paths, in-process
+      mock servers, and no machine-level residue.
+- **Verdict:** the phase commit is self-contained: every Phase 12 surface
+  (the 24 new Windows e2e tests, the two engine hardenings, the trimmed
+  `windows-sys` dev-dependency, the version bump) reproduces its result
+  set from a clean checkout on native Windows, and nothing in the
+  inherited seven grows. The gates are green everywhere except the
+  disclosed inherited failures, exactly as the entry declared.
+- **Clone failure-name re-confirmation (observed, `cargo test
+  --no-fail-fast --bin swift-fetch`, exit 101 as the seven predict):**
+  `segmented_recovery_failed_segment_retried`,
+  `segmented_recovery_handles_oversized_partial`,
+  `segmented_recovery_handles_unknown_size`,
+  `segmented_recovery_handles_truncated_partial`,
+  `segmented_recovery_skips_verified_completed_segments`,
+  `segmented_recovery_shutdown_parks_paused`,
+  `a_truncated_segment_is_retried_within_the_budget_and_never_finalized_early`
+  - the Phase 9-lineage set, identical in name to every previous full
+    run since Phase 10. Correction note, superseding wording: the
+    entry's verification list above paraphrased the names imprecisely
+    in one fragment ("...related ranges"); this addendum is the exact
+    offline record of the set - which Phase 12 observed unchanged in
+    both trees.
+
+
 
 
 
