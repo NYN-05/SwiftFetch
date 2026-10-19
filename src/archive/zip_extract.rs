@@ -651,6 +651,29 @@ mod tests {
         dir.canonicalize().expect("destination exists")
     }
 
+    /// Regression: containment must accept a fresh leaf under a plain
+    /// (never-canonicalized) root. On Windows `canonicalize` yields a
+    /// verbatim `\\?\` root while a plain join does not; comparing the
+    /// two forms mismatched at the drive prefix and refused every fresh
+    /// entry as an escape until the ancestor-walk resolution fixed it.
+    #[test]
+    fn a_fresh_leaf_under_a_plain_root_passes_containment() {
+        let temp = Scratch::new("containment");
+        make_out(&temp.path.join("root"));
+        let root = temp.path.join("root");
+        let resolved = validate_extracted_path("fresh/leaf.txt", &root)
+            .expect("a fresh leaf inside the root is accepted");
+        // The guarantee is containment w.r.t. the canonical root: the
+        // resolved product is a verbatim path on Windows, a plain join
+        // never is — the same comparison the engine makes.
+        let canonical_root = root.canonicalize().expect("the root exists");
+        assert!(
+            resolved.starts_with(&canonical_root),
+            "the resolved path stays inside the root: {}",
+            resolved.display()
+        );
+    }
+
     #[test]
     fn extracts_nested_paths_byte_for_byte() {
         let temp = Scratch::new("nested");

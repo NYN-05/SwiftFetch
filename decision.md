@@ -1330,6 +1330,139 @@ download-manager -> swift-fetch (v0.3.0)" (10 files changed, 37 insertions,
 |---|---|---|
 | ADR-0021 | Phase 8 segmentation: evidence-gated planning, validated span workers, discard-then-fallback, and the tested segment lifecycle graph | Accepted |
 
+## ADR-0022 - Phase 10 safe automatic ZIP extraction: finalization-gated trigger, sealed entry names, no-silent-overwrite collisions, bounded claims and writes, and a separately-ledgered extraction lifecycle
+
+- **Status:** Accepted
+- **Date:** 2026-10-19
+- **Context:** Phase 10 adds automatic extraction for downloaded ZIP
+  archives while commands remain unwired until Phase 11. The phase's
+  hard constraints: extraction may start only after a download *and* its
+  finalization succeed; no archive entry may write outside the intended
+  destination (absolute/rooted names, `..` traversal, drive and UNC
+  prefixes, redirection of any kind); existing user files are never
+  silently overwritten; the archive stays byte-for-byte intact when
+  extraction fails; extraction progress is tracked separately from the
+  download states; extraction can be disabled and retried without
+  redownloading; and a hostile archive must not exhaust resources. Every
+  reliability invariant in the project law binds here exactly as it did
+  for earlier phases - in particular, extraction failure must never
+  flip a successfully downloaded file to `failed`, and success must
+  never be claimed for a torn or partially-extracted destination.
+- **Decision:**
+  1. **Trigger law.** Extraction is requested only from the transfer
+     engine's finalization step, after the archive has landed at its
+     final name (same-volume rename of the engine partial) and before
+     the engine call returns. The run is awaited inline, not spawned
+     into the background, so the command wiring (Phase 11) and the test
+     suite observe one settled result per finalization. Shutdown,
+     failed, cancelled, and already-complete transfers never extract;
+     `--no-extract` (the `zip_auto_extract` switch) disables the whole
+     step at the driver boundary.
+  2. **Detection law.** Local magic bytes decide whether a finalized
+     file is offered to the extractor (the three ZIP signatures
+     `PK\x03\x04`, `PK\x05\x06`, `PK\x07\x08`); the file name and its
+     extension are hints only. A false offer (a non-ZIP whose bytes
+     faked or whose name promised a ZIP) fails cheaply as a format
+     error on the extraction record and leaves the completed download
+     untouched.
+  3. **Destination law.** The default destination is a dedicated folder
+     next to the archive named after its stem (`payload.zip` extracts
+     to `out\payload\`); a caller-override exists in the extraction
+     config. Nothing is ever extracted into the download directory
+     itself, so user files sitting there can never be mistaken for
+     archive content or clobbered by it.
+  4. **Name-sealing law.** Entry names are refused lexically before any
+     byte is written: rooted names (`/`, `\`), any parent (`..`)
+     component, drive-prefixed (`X:`/`X:dir`) or UNC-prefixed (`\\`)
+     first components, and non-UTF-8 names. Windows reserved device
+     stems (CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9, all components,
+     case-insensitive, `"stem.ext"`-shaped) are refused unconditionally
+     so host behavior never decides what got written. After the lexical
+     seal, the joined path is resolved through the filesystem: the root
+     is canonicalized, a fresh leaf is resolved by canonicalizing its
+     deepest existing ancestor and re-appending the missing names, and
+     anything resolving outside the canonical root is refused - a
+     symlink or mount point already inside the destination cannot
+     redirect writes elsewhere.
+  5. **Collision law.** An entry whose destination file already exists
+     is skipped with a warning and reported in the run outcome; the
+     documented default is never to overwrite silently. Replacement
+     exists only behind an explicit config switch (remove-then-write),
+     so repeated extraction of the same archive can never destroy user
+     data without a deliberate choice.
+  6. **Bounds law.** Declared sizes are untrusted. A pre-write claim
+     screen sums each entry's declared size and the cumulative total
+     against fixed limits (defaults: 1 GiB per entry, 10 GiB total) and
+     refuses before opening any output; the same limits are enforced
+     again on the bytes actually written (in bounded chunks), and a
+     violating partial file is removed so a claimed-small bomb cannot
+     leak past the screen.
+  7. **Ledger law.** Every triggered run owns one persistent extraction
+     record: `queued` before any work, `extracting` before the first
+     write, then `completed` or `failed` with `(category, message)`
+     details on every failure path (including pre-`extracting`
+     refusals). The record is the retry handle: retrying calls the same
+     extraction routine against the same record with no HTTP surface
+     anywhere in the module - a retry needs the preserved on-disk
+     archive, never the network. The download record never moves along
+     the ADR-0018 graph because extraction failed, and no extraction
+     record exists for transfers that never finalized.
+  8. **Engine contract change.** `transfer_persisted` gains a tenth
+     parameter, `zip_auto_extract: bool` (after the shutdown handle),
+     superseding the count recorded in ADR-0021's engine-contract note
+     while keeping its shape. The batch layer threads one flag into
+     every engine call (Phase 11 maps the CLI/config switch through
+     it).
+- **Alternatives considered (and rejected):**
+  1. **Spawned/background extraction** - rejected: the command layer
+     could exit before extraction settled and tests would race the
+     ledger; awaited inline work is deterministic and honest.
+  2. **Extension-driven detection** - rejected: extension is a hint, not
+     proof; renamed garbage would be decompressed by name trust. Magic
+     bytes mis-offer harmlessly (a cheap recorded format error).
+  3. **Fail-the-run-on-first-collision** - rejected: the spec prefers a
+     documented skip-and-report policy; per-file skips keep a run useful
+     and lossless by default, with replacement available explicitly.
+  4. **Trusting declared entry sizes** - rejected: the declaration is
+     the bomb's lie; only write-side enforcement bounds the real cost.
+  5. **Extracting into the download directory** - rejected: mixing
+     archive content with user files makes collisions both likely and
+     destructive; a dedicated sibling folder keeps the blast radius away
+     from existing names.
+  6. **Host-conditional reserved names** - rejected: gating on the host
+     would make behavior (and tests) diverge between platforms; the
+     unconditional refusal is predictable everywhere, Windows-first
+     included.
+- **Consequences:**
+  - Extraction is deterministic per finalized download: the engine
+    awaits it, so one invocation returns with extraction either
+    complete, recorded-failed, or skipped-by-config - never pending in
+    the background.
+  - Partial extraction states are honest and durable: a mid-run failure
+    leaves already-written files, a `failed` record with a message, the
+    archive byte-for-byte intact, and the download still `completed`;
+    the retry surface covers re-running without any redownload.
+  - The archive layout of `src/archive/` becomes live code for the
+    first time (the module placeholder is now the sealed extractor);
+    nothing outside it knows ZIP structure except the magic-byte gate
+    and its driver wiring in `src/download/resume.rs`.
+  - The extraction limits are engine-fixed (1 GiB / 10 GiB defaults)
+    pending any future configuration surface; they are deliberately not
+    caller-tunable in this phase.
+  - The mock server grew a raw-body knob (`with_raw_body`) so genuine
+    ZIP bytes can be served by tests without bending the fixture law.
+- **Related:** ADR-0016 (finalization/naming contract the extractor
+  preserves), ADR-0018 (download lifecycle graph; the extraction record
+  is a separate ledger and never drives it), ADR-0021 (the engine
+  contract the tenth parameter extends), `DOCS/phases.md` Phase 10,
+  `changes.md` Phase 10 entry.
+
+### Addendum-index extension (ADR-0022 row; frozen top index untouched)
+
+| ID | Title | Status |
+|---|---|---|
+| ADR-0022 | Phase 10 safe automatic ZIP extraction: finalization-gated trigger, sealed entry names, no-silent-overwrite collisions, bounded claims and writes, and a separately-ledgered extraction lifecycle | Accepted |
+
 
 
 

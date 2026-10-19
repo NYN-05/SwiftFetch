@@ -663,3 +663,64 @@ async fn the_active_get_gauge_sees_overlapping_bodies() {
         server.peak_active_gets()
     );
 }
+
+/// Phase 10 mock knob: a raw payload replaces the fixture bytes so ZIP
+/// archives can be served by engine tests. These tests lock the knob's
+/// exact wire behavior at the mock layer.
+#[tokio::test]
+async fn a_raw_payload_is_served_byte_for_byte_with_its_exact_length() {
+    let payload: &[u8] = b"a raw body served instead of the fixture";
+    let (_server, url) = one_route("/f", Behavior::default().with_raw_body(payload.to_vec())).await;
+    let client = http_client();
+
+    let response = send(&client, &url, Method::GET, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, &CONTENT_LENGTH),
+        payload.len().to_string(),
+        "the advertised length is the raw payload's"
+    );
+    assert_eq!(
+        body_bytes(response).await.as_ref(),
+        payload,
+        "a raw body is served byte-for-byte"
+    );
+}
+
+#[tokio::test]
+async fn honored_ranges_apply_to_a_raw_payload() {
+    let payload: &[u8] = b"a raw body sliced by the range law";
+    let (_server, url) = one_route("/f", Behavior::default().with_raw_body(payload.to_vec())).await;
+    let client = http_client();
+
+    let response = send(&client, &url, Method::GET, Some("bytes=4-11")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header(&response, &CONTENT_RANGE),
+        format!("bytes 4-11/{}", payload.len())
+    );
+    assert_eq!(
+        body_bytes(response).await.as_ref(),
+        &payload[4..12],
+        "the raw payload slices exactly like a fixture would"
+    );
+}
+
+#[tokio::test]
+async fn a_head_of_a_raw_payload_advertises_its_exact_length() {
+    let payload: &[u8] = b"a raw body advertised by head";
+    let (_server, url) = one_route("/f", Behavior::default().with_raw_body(payload.to_vec())).await;
+    let client = http_client();
+
+    let response = send(&client, &url, Method::HEAD, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, &CONTENT_LENGTH),
+        payload.len().to_string()
+    );
+    assert_eq!(
+        body_bytes(response).await.as_ref(),
+        b"",
+        "a HEAD answer carries no body"
+    );
+}
