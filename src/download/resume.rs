@@ -3363,7 +3363,7 @@ mod tests {
         )
         .expect("the stale validator stored");
         stage_segment(&repo, id, fixture.len, 512);
-        stage_partial(&dir, "changing-resume.bin", &*fixture.slice(0, 511));
+        stage_partial(&dir, "changing-resume.bin", &fixture.slice(0, 511));
 
         let download = drive(&repo, &server, "/changing-resume.bin", &dir, 5)
             .await
