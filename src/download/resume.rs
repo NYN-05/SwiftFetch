@@ -467,10 +467,15 @@ async fn run_attempt(ctx: &Attempt<'_>, plan: RecoveryPlan) -> Result<AttemptOut
             ctx.repo
                 .update_transfer_facts(record.id, &probe_facts(&facts), (ctx.now)())?;
             let redacted = redact_url(&facts.effective_url);
-            // If the record has segmented rows (from a previous segmented attempt),
-            // force sequential to avoid re-segmenting a restarted transfer.
+            // If the record has Downloading segment rows with min_byte > 0
+            // (interrupted mid-segment, data might be corrupt), force sequential
+            // to avoid re-segmenting potentially corrupt state. Pending rows
+            // from an aborted attempt and Failed rows retired by discard_segments
+            // are safe to re-segment.
             let rows = ctx.repo.list_segments(record.id)?;
-            let force_sequential = rows.len() > 1 || rows.iter().any(|r| r.min_byte > 0);
+            let force_sequential = rows
+                .iter()
+                .any(|r| matches!(r.state, SegmentState::Downloading) && r.min_byte > 0);
             full_transfer(
                 ctx,
                 record.id,
@@ -1093,19 +1098,29 @@ fn reconcile_segmented_download(
                     segments_completed.push(row.clone());
                     continue;
                 }
-                // The segment claims completion but the file is too short
-                // to contain it — the claim is not trustworthy.
-                tracing::debug!(
-                    "download record {}: segment {} (bytes {}-{}) claims completion \
-                     but file length {} does not reach it; will re-fetch",
+                // The segment claims completion but the file doesn't contain
+                // its data (file too short, or received_bytes doesn't match
+                // span length) — the claim is not trustworthy. Retire and
+                // insert a fresh Pending row for re-fetch.
+                repo.update_segment(row.id, SegmentState::Failed, 0)?;
+                let new_id = repo.insert_segment(
                     record.id,
-                    row.id,
-                    row.min_byte,
-                    row.max_byte,
-                    file_len
-                );
-                // Don't add the original Completed row to fetch list; we'll handle
-                // it in the later loop by retiring and inserting a fresh Pending row.
+                    NewSegment {
+                        min_byte: row.min_byte,
+                        max_byte: row.max_byte,
+                        state: SegmentState::Pending,
+                        received_bytes: 0,
+                    },
+                )?;
+                segments_to_fetch.push(SegmentRecord {
+                    id: new_id,
+                    download_id: row.download_id,
+                    min_byte: row.min_byte,
+                    max_byte: row.max_byte,
+                    state: SegmentState::Pending,
+                    received_bytes: 0,
+                });
+                continue;
             }
             SegmentState::Downloading => {
                 // Interrupted mid-stream. The received_bytes may be
@@ -4689,7 +4704,8 @@ mod tests {
             "/short-segment.bin",
             Behavior::default()
                 .with_fixture(fixture)
-                .with_truncate_after_probe(1, 100),
+                .with_truncate_after_probe(1, 100)
+                .with_etag(Validators::Static),
         );
         let (scratch, repo) = scratch_repo("segmented-truncated");
         let dir = scratch.path().to_owned();
@@ -4887,7 +4903,9 @@ mod tests {
         let fixture = Fixture::new(42, 32 * 1024); // 32 KiB, 4 segments of 8 KiB
         server.mount_route(
             "/segmented.bin",
-            Behavior::default().with_fixture(fixture).with_etag(Validators::Static),
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_etag(Validators::Static),
         );
 
         let (scratch, repo) = scratch_repo("seg-recovery-skip");
@@ -4914,7 +4932,7 @@ mod tests {
             &TransferFacts {
                 effective_url: Some(url.clone()),
                 expected_size: Some(fixture.len),
-                etag: Some("\"etag-seg\"".to_owned()),
+                etag: Some(format!("\"fixture-{}-{}\"", fixture.seed, fixture.len)),
                 last_modified: None,
             },
             test_clock(),
@@ -4946,22 +4964,14 @@ mod tests {
             .expect("segmented recovery completes");
 
         // Verify only segments 2 and 3 were requested
-        let requests = server.requests();
-        let requested: Vec<_> = requests
-            .iter()
-            .filter(|r| r.method == "GET" && r.path == "/segmented.bin" && r.range.is_some())
-            .collect();
+        let requested = transfer_ranges(&server, "/segmented.bin");
         assert_eq!(
             requested.len(),
             2,
             "only incomplete segments re-fetched: {requested:?}"
         );
-        assert!(requested
-            .iter()
-            .any(|r| r.range.as_deref() == Some("bytes=16384-24575")));
-        assert!(requested
-            .iter()
-            .any(|r| r.range.as_deref() == Some("bytes=24576-32767")));
+        assert!(requested.iter().any(|r| r == "bytes=16384-24575"));
+        assert!(requested.iter().any(|r| r == "bytes=24576-32767"));
 
         // Verify final file is byte-exact
         assert_eq!(download.bytes_written, fixture.len);
@@ -5057,7 +5067,9 @@ mod tests {
         let fixture = Fixture::new(42, 32 * 1024);
         server.mount_route(
             "/seg-truncated.bin",
-            Behavior::default().with_fixture(fixture),
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_etag(Validators::Static),
         );
 
         let (scratch, repo) = scratch_repo("seg-recovery-truncated");
@@ -5083,7 +5095,7 @@ mod tests {
             &TransferFacts {
                 effective_url: Some(url.clone()),
                 expected_size: Some(fixture.len),
-                etag: Some("\"etag-trunc\"".to_owned()),
+                etag: Some(format!("\"fixture-{}-{}\"", fixture.seed, fixture.len)),
                 last_modified: None,
             },
             test_clock(),
@@ -5108,13 +5120,9 @@ mod tests {
             .await
             .expect("recovery with truncated partial completes");
 
-        let requests = server.requests();
-        let requested: Vec<_> = requests
-            .iter()
-            .filter(|r| r.method == "GET" && r.path == "/seg-truncated.bin" && r.range.is_some())
-            .collect();
+        let requested = transfer_ranges(&server, "/seg-truncated.bin");
         assert_eq!(requested.len(), 1);
-        assert_eq!(requested[0].range.as_deref(), Some("bytes=16384-32767"));
+        assert_eq!(requested[0], "bytes=16384-32767");
 
         assert_eq!(download.bytes_written, fixture.len);
         assert_eq!(
@@ -5132,7 +5140,9 @@ mod tests {
         let fixture = Fixture::new(42, 32 * 1024);
         server.mount_route(
             "/seg-oversized.bin",
-            Behavior::default().with_fixture(fixture),
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_etag(Validators::Static),
         );
 
         let (scratch, repo) = scratch_repo("seg-recovery-oversized");
@@ -5158,7 +5168,7 @@ mod tests {
             &TransferFacts {
                 effective_url: Some(url.clone()),
                 expected_size: Some(fixture.len),
-                etag: Some("\"etag-over\"".to_owned()),
+                etag: Some(format!("\"fixture-{}-{}\"", fixture.seed, fixture.len)),
                 last_modified: None,
             },
             test_clock(),
@@ -5185,12 +5195,8 @@ mod tests {
             .expect("restart after oversized partial completes");
 
         // Should have done a full sequential fetch (no ranged requests for segments)
-        let requests = server.requests();
-        let ranged: Vec<_> = requests
-            .iter()
-            .filter(|r| r.method == "GET" && r.path == "/seg-oversized.bin" && r.range.is_some())
-            .collect();
-        assert_eq!(ranged.len(), 0, "oversized file triggers full restart");
+        let requested = transfer_ranges(&server, "/seg-oversized.bin");
+        assert_eq!(requested.len(), 0, "oversized file triggers full restart");
 
         assert_eq!(download.bytes_written, fixture.len);
     }
@@ -5202,7 +5208,9 @@ mod tests {
         let fixture = Fixture::new(42, 32 * 1024);
         server.mount_route(
             "/seg-unknown-size.bin",
-            Behavior::default().with_fixture(fixture),
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_etag(Validators::Static),
         );
 
         let (scratch, repo) = scratch_repo("seg-recovery-unknown-size");
@@ -5229,7 +5237,7 @@ mod tests {
             &TransferFacts {
                 effective_url: Some(url.clone()),
                 expected_size: None,
-                etag: Some("\"etag-us\"".to_owned()),
+                etag: Some(format!("\"fixture-{}-{}\"", fixture.seed, fixture.len)),
                 last_modified: None,
             },
             test_clock(),
@@ -5252,12 +5260,8 @@ mod tests {
             .await
             .expect("restart after unknown size completes");
 
-        let requests = server.requests();
-        let ranged: Vec<_> = requests
-            .iter()
-            .filter(|r| r.method == "GET" && r.path == "/seg-unknown-size.bin" && r.range.is_some())
-            .collect();
-        assert_eq!(ranged.len(), 0, "unknown size triggers full restart");
+        let requested = transfer_ranges(&server, "/seg-unknown-size.bin");
+        assert_eq!(requested.len(), 0, "unknown size triggers full restart");
     }
 
     #[tokio::test]
@@ -5355,7 +5359,8 @@ mod tests {
             "/seg-shutdown.bin",
             Behavior::default()
                 .with_fixture(fixture)
-                .with_delay_body_ms(50),
+                .with_delay_body_ms(50)
+                .with_etag(Validators::Static),
         );
 
         let (scratch, repo) = scratch_repo("seg-recovery-shutdown");
@@ -5381,7 +5386,7 @@ mod tests {
             &TransferFacts {
                 effective_url: Some(url.clone()),
                 expected_size: Some(fixture.len),
-                etag: Some("\"etag-sd\"".to_owned()),
+                etag: Some(format!("\"fixture-{}-{}\"", fixture.seed, fixture.len)),
                 last_modified: None,
             },
             test_clock(),
@@ -5527,7 +5532,12 @@ mod tests {
         // is re-fetched during recovery.
         let server = MockServer::start().await;
         let fixture = Fixture::new(42, 32 * 1024);
-        server.mount_route("/seg-failed.bin", Behavior::default().with_fixture(fixture));
+        server.mount_route(
+            "/seg-failed.bin",
+            Behavior::default()
+                .with_fixture(fixture)
+                .with_etag(Validators::Static),
+        );
 
         let (scratch, repo) = scratch_repo("seg-recovery-failed");
         let dir = scratch.path().to_owned();
@@ -5552,7 +5562,7 @@ mod tests {
             &TransferFacts {
                 effective_url: Some(url.clone()),
                 expected_size: Some(fixture.len),
-                etag: Some("\"etag-fail\"".to_owned()),
+                etag: Some(format!("\"fixture-{}-{}\"", fixture.seed, fixture.len)),
                 last_modified: None,
             },
             test_clock(),
@@ -5578,22 +5588,14 @@ mod tests {
             .await
             .expect("recovery with failed segment completes");
 
-        let requests = server.requests();
-        let requested: Vec<_> = requests
-            .iter()
-            .filter(|r| r.method == "GET" && r.path == "/seg-failed.bin" && r.range.is_some())
-            .collect();
+        let requested = transfer_ranges(&server, "/seg-failed.bin");
         assert_eq!(
             requested.len(),
             2,
             "both failed and pending segments re-fetched"
         );
-        assert!(requested
-            .iter()
-            .any(|r| r.range.as_deref() == Some("bytes=10922-21843")));
-        assert!(requested
-            .iter()
-            .any(|r| r.range.as_deref() == Some("bytes=21844-32767")));
+        assert!(requested.iter().any(|r| r == "bytes=10922-21843"));
+        assert!(requested.iter().any(|r| r == "bytes=21844-32767"));
 
         assert_eq!(download.bytes_written, fixture.len);
         assert_eq!(
