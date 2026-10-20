@@ -17,7 +17,7 @@ Built with correctness and file integrity as the top priorities — never silent
 - [Installation](#installation)
 - [Usage](#usage)
 - [Configuration](#configuration)
-- [Resume & Recovery](#resume--recovery)
+- [Resume &amp; Recovery](#resume--recovery)
 - [ZIP Extraction](#zip-extraction)
 - [Exit Codes](#exit-codes)
 - [Logging](#logging)
@@ -26,7 +26,7 @@ Built with correctness and file integrity as the top priorities — never silent
 - [Performance](#performance)
 - [Testing](#testing)
 - [Windows Support](#windows-support)
-- [Scope & Limitations](#scope--limitations)
+- [Scope &amp; Limitations](#scope--limitations)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -34,17 +34,17 @@ Built with correctness and file integrity as the top priorities — never silent
 
 ## Features
 
-| Feature | Description |
-|---|---|
-| **Single & multiple URL downloads** | Download one URL, several URLs in one invocation, or URLs from a plain-text list file |
-| **Bounded concurrency** | Configurable maximum concurrent file downloads (default: 3) — never one task per URL |
-| **Segmented downloads** | Parallel byte-range downloads for large files (default: 32 MiB minimum, 4 segments max) |
-| **Resume & retry** | Resume interrupted downloads with validator revalidation; bounded exponential backoff with jitter (default: 5 retries) |
-| **Automatic ZIP extraction** | Extracts completed ZIP archives into a dedicated sibling folder (default: enabled) |
-| **Safe finalization** | Writes to engine-owned partial files, finalizes via same-volume rename, never overwrites existing files |
-| **Persistent queue** | SQLite-backed queue in `%LOCALAPPDATA%\SwiftFetch\swiftfetch.sqlite3` — survives process exit and restart |
-| **Windows-first** | Validated Windows filename handling (reserved stems, illegal characters, 255 UTF-16 unit cap) |
-| **CLI-only** | No GUI, no browser integration, no background services, no telemetry |
+| Feature                                   | Description                                                                                                            |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Single & multiple URL downloads** | Download one URL, several URLs in one invocation, or URLs from a plain-text list file                                  |
+| **Bounded concurrency**             | Configurable maximum concurrent file downloads (default: 3) — never one task per URL                                  |
+| **Segmented downloads**             | Parallel byte-range downloads for large files (default: 32 MiB minimum, 4 segments max)                                |
+| **Resume & retry**                  | Resume interrupted downloads with validator revalidation; bounded exponential backoff with jitter (default: 5 retries) |
+| **Automatic ZIP extraction**        | Extracts completed ZIP archives into a dedicated sibling folder (default: enabled)                                     |
+| **Safe finalization**               | Writes to engine-owned partial files, finalizes via same-volume rename, never overwrites existing files                |
+| **Persistent queue**                | SQLite-backed queue in `%LOCALAPPDATA%\SwiftFetch\swiftfetch.sqlite3` — survives process exit and restart           |
+| **Windows-first**                   | Validated Windows filename handling (reserved stems, illegal characters, 255 UTF-16 unit cap)                          |
+| **CLI-only**                        | No GUI, no browser integration, no background services, no telemetry                                                   |
 
 ---
 
@@ -56,7 +56,7 @@ git clone https://github.com/NYN-05/SwiftFetch.git
 cd SwiftFetch
 
 # Build in release mode
-cargo build --release
+https://fuckingfast.co/8cw9qshukcmz#CoD_MW4_--_fitgirl-repacks.site_--_.part30.rar
 
 # Download a single file
 .\target\release\swift-fetch.exe download https://example.com/file.zip
@@ -113,14 +113,14 @@ Download one URL, several URLs, or URLs from a list file.
 swift-fetch download <URL...> [options]
 ```
 
-| Option | Short | Default | Description |
-|---|---|---|---|
-| `--url-file <PATH>` | `-f` | — | Plain-text file with one URL per line (blank lines and `#`-comments ignored; UTF-8 BOM on line 1 tolerated) |
-| `--output <DIR>` | `-o` | `.` | Output directory for downloaded files |
-| `--files <N>` | `-j` | `3` | Maximum concurrent file downloads |
-| `--segments <N>` | `-s` | `4` | Maximum byte-range segments per file |
-| `--retries <N>` | `-r` | `5` | Retry attempts for transient failures (`0` = no retries) |
-| `--no-extract` | | enabled | Disable automatic ZIP extraction |
+| Option                | Short  | Default | Description                                                                                                   |
+| --------------------- | ------ | ------- | ------------------------------------------------------------------------------------------------------------- |
+| `--url-file <PATH>` | `-f` | —      | Plain-text file with one URL per line (blank lines and `#`-comments ignored; UTF-8 BOM on line 1 tolerated) |
+| `--output <DIR>`    | `-o` | `.`   | Output directory for downloaded files                                                                         |
+| `--files <N>`       | `-j` | `3`   | Maximum concurrent file downloads                                                                             |
+| `--segments <N>`    | `-s` | `4`   | Maximum byte-range segments per file                                                                          |
+| `--retries <N>`     | `-r` | `5`   | Retry attempts for transient failures (`0` = no retries)                                                    |
+| `--no-extract`      |        | enabled | Disable automatic ZIP extraction                                                                              |
 
 At least one URL or a `--url-file` must be provided. Inline URLs must start with `http://` or `https://`.
 
@@ -170,15 +170,15 @@ swift-fetch.exe retry
 
 Defaults follow `DOCS/architecture.md` §6 and are provisional starting values tuned only with benchmark evidence:
 
-| Setting | Default | Description |
-|---|---|---|
-| Concurrent file downloads | `3` | Maximum files downloading simultaneously |
-| Segments per file | `4` | Maximum byte-range segments per file |
-| Minimum file size for segmentation | `32 MiB` | Files below this size stream sequentially |
-| Nominal segment size | `~8 MiB` | Target size per segment |
-| Retry attempts | `5` | Bounded retries for transient failures |
-| Automatic ZIP extraction | `enabled` | Extract completed ZIP archives by default |
-| Existing-file behavior | `never overwrite` | Collision policy appends `(n)` suffixes |
+| Setting                            | Default             | Description                               |
+| ---------------------------------- | ------------------- | ----------------------------------------- |
+| Concurrent file downloads          | `3`               | Maximum files downloading simultaneously  |
+| Segments per file                  | `4`               | Maximum byte-range segments per file      |
+| Minimum file size for segmentation | `32 MiB`          | Files below this size stream sequentially |
+| Nominal segment size               | `~8 MiB`          | Target size per segment                   |
+| Retry attempts                     | `5`               | Bounded retries for transient failures    |
+| Automatic ZIP extraction           | `enabled`         | Extract completed ZIP archives by default |
+| Existing-file behavior             | `never overwrite` | Collision policy appends `(n)` suffixes |
 
 Connection timeout is **15 s**; each body read is bounded by a **30 s** idle budget (total transfer duration is unbounded — large downloads are legitimate).
 
@@ -231,11 +231,11 @@ Use `--no-extract` to disable automatic extraction.
 
 ## Exit Codes
 
-| Code | Meaning |
-|---|---|
-| `0` | Every requested download of the invocation completed |
+| Code  | Meaning                                                                    |
+| ----- | -------------------------------------------------------------------------- |
+| `0` | Every requested download of the invocation completed                       |
 | `1` | At least one did not (failed or interrupted), or the command could not run |
-| `2` | Invalid invocation or configuration |
+| `2` | Invalid invocation or configuration                                        |
 
 Logging (enable with `-v`) goes to **stderr**; stdout stays reserved for results and controlled progress lines. Every logged or displayed URL is redacted (query string and fragment dropped, passwords masked).
 
