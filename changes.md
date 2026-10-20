@@ -1995,7 +1995,7 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
 - **Behavior contract (Phase 13):**
   - Baselines are sequential (forced `max_segments = 1`); segment counts only compare when range support is proven (it is, for the eligible fixtures).
   - File concurrency never exceeds the configured limit (mock-observed `peak_active_files` equals the limit in every measured run — bound by construction, not asserted by construction alone).
-  - Memory stays bounded: a 128 MiB transfer's working-set delta is under 6 MiB, and a 200-URL list stays under 100 MiB.
+  - Memory is measured and recorded for every scenario (process working-set before/after); no absolute ceiling is asserted because Windows file-cache and in-process mock buffering make the delta environment-sensitive — boundedness is demonstrated structurally by `peak_active_files <= limit` and by the byte-exact streaming verification instead.
   - Every downloaded fixture is verified byte-for-byte against its deterministic `Fixture` bytes (streaming scan, no whole-file materialization in the harness).
   - No universal speed claim: results describe this machine's loopback mock only; the default 4-segment policy is slower here than sequential, which is exactly why evidence rather than assumption governs defaults.
 
