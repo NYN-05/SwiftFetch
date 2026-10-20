@@ -4885,7 +4885,10 @@ mod tests {
         // on disk should only re-fetch the incomplete segments.
         let server = MockServer::start().await;
         let fixture = Fixture::new(42, 32 * 1024); // 32 KiB, 4 segments of 8 KiB
-        server.mount_route("/segmented.bin", Behavior::default().with_fixture(fixture));
+        server.mount_route(
+            "/segmented.bin",
+            Behavior::default().with_fixture(fixture).with_etag(Validators::Static),
+        );
 
         let (scratch, repo) = scratch_repo("seg-recovery-skip");
         let dir = scratch.path().to_owned();
