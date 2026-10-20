@@ -2301,7 +2301,7 @@ Per-scenario observed results (loopback mock, `Release` not used; debug profile,
   phase-boundary law) pending the owner's explicit decision on a Phase 9
   repair.
 
-## Phase 14 — Documentation and Release Readiness (v0.16.0)
+## Phase 14 — Documentation and Release Readiness (v0.15.0)
 
 - **Commit:** this entry commits with the phase work (the entry cannot
   know its own hash); the post-commit verification addendum below records
