@@ -2301,6 +2301,76 @@ Per-scenario observed results (loopback mock, `Release` not used; debug profile,
   phase-boundary law) pending the owner's explicit decision on a Phase 9
   repair.
 
+## Phase 14 — Documentation and Release Readiness (v0.16.0)
+
+- **Commit:** this entry commits with the phase work (the entry cannot
+  know its own hash); the post-commit verification addendum below records
+  it together with the release-build smoke test and fresh-clone gate results.
+- **Outcome:** Phase 14 exit gate met (working tree, native Windows).
+  User-facing documentation is complete and accurate: the README now carries
+  the corrected phase/build status (Phase 13 / v0.15.0), a full command
+  reference (`download`/`status`/`resume`/`retry` with every flag and its
+  default), configuration values, the data location, retry behavior, resume
+  limitations, ZIP extraction destination and collision policy, exit codes,
+  logging, Windows build/test/release commands, a release-artifact smoke test,
+  and evidence-based known limitations. Only commands and flags that exist and
+  have passing tests are documented. A release-mode executable was built and
+  smoke-tested from a clean environment against a local HTTP fixture:
+  concurrent download (exit 0, bounded concurrency), byte-exact file
+  verification, `status`, automatic ZIP extraction, and `--no-extract` all
+  pass. No GUI, service, daemon, telemetry, or unrelated feature is present.
+- **Code changes:**
+
+| File | Change |
+|---|---|
+| `README.md` | Rewritten for Phase 14: corrected phase/build status (Phase 13 / v0.15.0); full command reference with flags and defaults; configuration table; data location (`%LOCALAPPDATA%\SwiftFetch\swiftfetch.sqlite3`, `SWIFT_FETCH_DATABASE`); retry behavior (bounded exponential backoff + jitter, defaults); resume limitations (depends on server range support and validators); ZIP extraction (dedicated folder beside the archive, sealed entry paths, skip-and-report collision policy, archive preserved on failure, `--no-extract`, retried without redownload); exit codes; logging-to-stderr; Windows-first platform; prerequisites; build/test/release commands; release-artifact smoke test; evidence-based known limitations |
+| `Cargo.toml` / `Cargo.lock` | unchanged from Phase 13 (v0.15.0); no new dependencies, no feature changes — dependency/packaging review confirms the approved stack only, all dev-dependencies test-only and never linked into the product binary |
+
+- **Behavior contract (Phase 14):**
+  - Documentation describes only implemented, tested behavior; no future-phase
+    or out-of-scope feature is documented as present.
+  - Resume and segmentation are documented as depending on server behavior,
+    metadata, and HTTP range support.
+  - ZIP extraction destination (dedicated folder beside the archive) and
+    collision policy (never overwrite silently; skip-and-report) are
+    documented.
+  - Queue metadata location and resume of interrupted downloads are
+    documented.
+  - Troubleshooting guidance is based on actual error categories and the
+    disclosed known limitations.
+- **Disclosures:**
+  - *Seven pre-existing Phase 9-lineage failures unchanged.* Every full
+    `cargo test --no-fail-fast` run reports the same seven inherited
+    segmented-recovery failures (identical names and panic lines as the
+    Phase 10/11/12/13 records). Phase 14 changes no code, so these are
+    unchanged; they remain pending the owner's explicit decision on a Phase 9
+    repair.
+  - *Release build smoke test is environment-scoped.* It was run against a
+    local Python HTTP fixture on this machine; results describe this machine,
+    not a universal release guarantee.
+- **Verification - actual results (all run on Windows, working tree v0.15.0):**
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, exit 0 |
+| plain `cargo build` | pass, exit 0 |
+| `cargo build --release` | pass, exit 0 (release artifact `target/release/swift-fetch.exe`) |
+| `cargo test --no-fail-fast` (unit target) | **277 passed / 7 failed** - exactly the seven inherited Phase 9-lineage failures; nothing new |
+| `cargo test --no-fail-fast` (`tests/cli.rs`) | **24 passed / 0 failed** |
+| `cargo test --no-fail-fast` (`tests/fixtures.rs`) | **15 passed / 0 failed** |
+| `cargo test --no-fail-fast` (`tests/mock_server.rs`) | **33 passed / 0 failed** |
+| `cargo test --no-fail-fast` (`tests/windows.rs`) | **24 passed / 0 failed** |
+| Release-exe smoke test (local HTTP fixture) | **passed** — concurrent download exit 0 ("2 completed, 0 failed, 0 interrupted of 2; peak active downloads 2 of the configured 3"), byte-exact fixture, `status` lists completed records, automatic ZIP extraction writes the entry, `--no-extract` keeps the archive unextracted |
+- **Scope-control notes:**
+  - No code changes in Phase 14; documentation and verification only.
+  - No new dependencies; dependency/packaging review confirms the approved
+    stack only, all dev-dependencies test-only.
+  - Release-mode executable builds cleanly on Windows and runs from a clean
+    environment with a hermetic `SWIFT_FETCH_DATABASE` path.
+  - Installs no Windows service, resident daemon, or auto-start entry.
+
+
 
 
 
