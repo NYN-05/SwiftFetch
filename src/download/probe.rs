@@ -66,6 +66,23 @@ pub struct ProbeResult {
     pub last_modified: Option<String>,
     /// Final URL after permitted redirects (never logged raw).
     pub effective_url: String,
+    /// The `Content-Type` media type the probe's metadata response
+    /// declared, as raw header text (safe metadata: it names the nature of
+    /// the response, never user data). `None` when absent or unprintable.
+    pub content_type: Option<String>,
+}
+
+impl ProbeResult {
+    /// Whether the probe's declared media type claims HTML — a lead that
+    /// the URL may serve a landing page rather than a file (`Content-Type`
+    /// alone is not definitive proof; the transfer engines pair this with
+    /// bounded body inspection).
+    #[must_use]
+    pub fn looks_like_html(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .is_some_and(crate::download::http::media_type_is_html)
+    }
 }
 
 /// The states a `Content-Length` value can be in after strict parsing.
@@ -402,6 +419,7 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
         return Err(http_status_error(
             head_status,
             format!("the remote server responded HTTP {head_status} for {redacted}"),
+            Some(head_response.headers()),
         ));
     }
 
@@ -409,6 +427,9 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
     let head_meta = response_meta(&head_response);
     let (head_etag, head_modified, effective_url) = response_identity(&head_response);
     let head_effective = head_response.url().clone();
+    // Safe metadata only: the declared media type, kept for a cautious
+    // landing-page lead (never treated as proof).
+    let head_content_type = raw_content_type(head_response.headers());
     // head_response is abandoned here: a HEAD body carries no bytes worth
     // keeping, and no probe response body is ever read.
 
@@ -416,13 +437,16 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
     // zero-length representation is unsatisfiable).
     if let ContentLength::Valid(0) = head_meta.cl {
         tracing::debug!("the remote resource is empty (Content-Length 0)");
-        return Ok(ProbeResult {
+        let facts = ProbeResult {
             expected_size: Some(0),
             range: RangeSupport::Unknown,
             etag: head_etag,
             last_modified: head_modified,
             effective_url,
-        });
+            content_type: head_content_type,
+        };
+        warn_on_html_media_type(&facts, &redact_url(facts.effective_url.as_str()));
+        return Ok(facts);
     }
 
     // 3. Secondary evidence: one bounded ranged request on the proven URL.
@@ -445,7 +469,7 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
                 redact_url(effective_url.as_str()),
                 err
             );
-            return Ok(ProbeResult {
+            let facts = ProbeResult {
                 expected_size: match head_size {
                     ContentLength::Valid(size) => Some(size),
                     _ => None,
@@ -454,9 +478,15 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
                 etag: head_etag,
                 last_modified: head_modified,
                 effective_url,
-            });
+                content_type: head_content_type,
+            };
+            warn_on_html_media_type(&facts, &redact_url(facts.effective_url.as_str()));
+            return Ok(facts);
         }
     };
+    // The ranged response is the nearer view of the representation actually
+    // transferred: prefer its declared media type over HEAD's.
+    let get_content_type = raw_content_type(get_response.headers());
     let (answer, get_meta) = classify_ranged_response(&get_response, head_size);
     let (range, expected_size) = classify(head_size, answer, &get_meta);
     if matches!(answer, RangeAnswer::Contradicted) {
@@ -465,13 +495,16 @@ pub(crate) async fn probe(client: &HttpClient, url: &str) -> Result<ProbeResult,
             redact_url(effective_url.as_str())
         );
     }
-    Ok(ProbeResult {
+    let facts = ProbeResult {
         expected_size,
         range,
         etag: get_meta.etag.or(head_etag),
         last_modified: get_meta.last_modified.or(head_modified),
         effective_url,
-    })
+        content_type: get_content_type.or(head_content_type),
+    };
+    warn_on_html_media_type(&facts, &redact_url(facts.effective_url.as_str()));
+    Ok(facts)
 }
 
 /// Probes a resource whose HEAD was rejected (`405`/`501`): the ranged GET
@@ -495,6 +528,7 @@ async fn probe_by_ranged_get(
             format!(
                 "the remote server responded HTTP {status} for {redacted} (HEAD and the ranged fallback both rejected)"
             ),
+            Some(response.headers()),
         ));
     }
     let (etag, last_modified, effective_url) = response_identity(&response);
@@ -506,13 +540,37 @@ async fn probe_by_ranged_get(
             redact_url(head_effective.as_str())
         );
     }
-    Ok(ProbeResult {
+    let facts = ProbeResult {
         expected_size,
         range,
         etag,
         last_modified,
         effective_url,
-    })
+        content_type: raw_content_type(response.headers()),
+    };
+    warn_on_html_media_type(&facts, &redact_url(facts.effective_url.as_str()));
+    Ok(facts)
+}
+
+/// The raw `Content-Type` header text of a response, when printable.
+fn raw_content_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// Warns when a probe's declared media type claims HTML — a lead that the
+/// URL may serve a landing page rather than a file. `Content-Type` alone
+/// is never treated as proof: the transfer engines pair this signal with a
+/// bounded body inspection before refusing any transfer.
+fn warn_on_html_media_type(facts: &ProbeResult, redacted: &str) {
+    if facts.looks_like_html() {
+        tracing::warn!(
+            "the remote advertised `Content-Type: {}` for {redacted}; this URL may be a landing page rather than a direct file link",
+            facts.content_type.as_deref().unwrap_or_default(),
+        );
+    }
 }
 
 /// Validates that `url` is a direct HTTP/HTTPS resource.
@@ -556,11 +614,14 @@ mod tests {
 
     /// A client with a shortened overall timeout for timeout tests.
     fn quick_client(ms: u64) -> HttpClient {
-        HttpClient::new(HttpTimeouts {
-            connect: Duration::from_secs(5),
-            metadata: Duration::from_millis(ms),
-            body_idle: Duration::from_secs(30),
-        })
+        HttpClient::new(
+            HttpTimeouts {
+                connect: Duration::from_secs(5),
+                metadata: Duration::from_millis(ms),
+                body_idle: Duration::from_secs(30),
+            },
+            None,
+        )
         .expect("custom timeouts build a client")
     }
 
@@ -1403,5 +1464,156 @@ mod tests {
     /// Log-safe rendering of a URL, mirroring the probe's own discipline.
     fn redacted_of(url: &str) -> String {
         crate::logging::redact_url(url)
+    }
+
+    // -- response diagnostics ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn http_403_diagnostics_name_the_status_and_next_steps() {
+        let mut server = MockServer::start().await;
+        server.mount_route("/forbidden", Behavior::default().with_status(403));
+        let url = server.url("/forbidden");
+
+        let err = probe(&client(), &url)
+            .await
+            .expect_err("a 403 is a permanent refusal, not silence");
+        assert_eq!(err.category(), ErrorCategory::Http);
+        let message = err.message();
+        assert!(
+            message.contains("403") && message.contains("forbidden"),
+            "the message names the status and the refusal: {message}"
+        );
+        assert!(
+            message.contains(&redacted_of(&url)),
+            "the URL in the message is the log-safe form: {message}"
+        );
+        assert!(
+            message.contains("bot-protected"),
+            "the message offers a concise explanation of likely causes: {message}"
+        );
+        assert!(
+            !message.contains("landing page"),
+            "without an HTML media type there is no landing-page lead: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_403_with_an_html_media_type_warns_about_landing_pages() {
+        let mut server = MockServer::start().await;
+        server.mount_route(
+            "/landing",
+            Behavior::default()
+                .with_status(403)
+                .with_content_type("text/html; charset=utf-8"),
+        );
+        let url = server.url("/landing");
+
+        let err = probe(&client(), &url)
+            .await
+            .expect_err("a 403 remains a refusal");
+        let message = err.message();
+        assert!(
+            message.contains("403") && message.contains("landing page"),
+            "the HTML media type adds the landing-page lead to the refusal: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_401_and_404_diagnostics_name_their_causes() {
+        let mut server = MockServer::start().await;
+
+        server.mount_route("/auth", Behavior::default().with_status(401));
+        let auth_err = probe(&client(), &server.url("/auth"))
+            .await
+            .expect_err("401 is a refusal");
+        assert!(
+            auth_err.message().contains("401") && auth_err.message().contains("authentication"),
+            "the 401 message explains what is missing: {}",
+            auth_err.message()
+        );
+
+        server.mount_route("/gone", Behavior::default().with_status(404));
+        let gone_err = probe(&client(), &server.url("/gone"))
+            .await
+            .expect_err("404 is a refusal");
+        assert!(
+            gone_err.message().contains("404") && gone_err.message().contains("not found"),
+            "the 404 message explains what happened: {}",
+            gone_err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_with_a_retry_after_names_the_suggested_wait() {
+        let mut server = MockServer::start().await;
+        server.mount_route(
+            "/limited",
+            Behavior::default()
+                .with_status(429)
+                .with_retry_after(9),
+        );
+        let url = server.url("/limited");
+
+        let err = probe(&client(), &url)
+            .await
+            .expect_err("a probe attempt fails on a 429");
+        let message = err.message();
+        assert!(
+            message.contains("429") && message.contains("retrying after 9 seconds"),
+            "the suggested wait is carried into the message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_without_retry_after_says_try_again_later() {
+        let mut server = MockServer::start().await;
+        server.mount_route("/limited-plain", Behavior::default().with_status(429));
+        let url = server.url("/limited-plain");
+
+        let err = probe(&client(), &url).await.expect_err("a 429 is a failure");
+        assert!(
+            err.message().contains("429") && err.message().contains("try again later"),
+            "without a numeric wait the message stays generic: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_statuses_carry_the_transient_explanation() {
+        let mut server = MockServer::start().await;
+        server.mount_route("/overloaded", Behavior::default().with_status(503));
+        let url = server.url("/overloaded");
+
+        let err = probe(&client(), &url).await.expect_err("a 503 is a failure");
+        let message = err.message();
+        assert!(
+            message.contains("503") && message.contains("server error"),
+            "a 5xx message explains the situation: {message}"
+        );
+    }
+
+    // A landing-page-shaped success (200): the suspicion is a fact a caller
+    // sees through the probe, not a refusal; range evidence stays ignored.
+    #[tokio::test]
+    async fn the_probe_records_the_declared_media_type_as_a_fact() {
+        let mut server = MockServer::start().await;
+        server.mount_route(
+            "/page",
+            Behavior::default()
+                .with_raw_body(b"<!DOCTYPE html><html><body>landing</body></html>".to_vec())
+                .with_content_type("text/html; charset=utf-8")
+                .with_range(RangeMode::Ignore),
+        );
+        let url = server.url("/page");
+
+        let client = client();
+        let facts = probe(&client, &url)
+            .await
+            .expect("an HTML page probes fine: the suspicion is a fact, not a refusal");
+        assert!(
+            facts.looks_like_html(),
+            "the declared media type lands in the probe facts: {:?}",
+            facts.content_type
+        );
     }
 }

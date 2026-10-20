@@ -46,7 +46,7 @@ use crate::cli::progress::{
 use crate::cli::status::{status_lines, StatusRow};
 use crate::cli::DownloadArgs;
 use crate::config::AppConfig;
-use crate::download::http::HttpClient;
+use crate::download::http::{HttpClient, HttpTimeouts};
 use crate::download::progress::{Progress, TransferKey, TransferRegistry};
 use crate::download::resume::{transfer_persisted, ShutdownHandle, ShutdownSignal, RECOVERABLE};
 use crate::download::retry::RetryPolicy;
@@ -105,7 +105,7 @@ impl Plumbing {
         let repo = Repository::open(&database)?;
         Ok(Self {
             repo,
-            client: HttpClient::default_client()?,
+            client: HttpClient::new(HttpTimeouts::default(), config.user_agent.clone())?,
             policy: RetryPolicy::from_retries(config.retry_attempts),
             segmentation: SegmentationPolicy::from_config(&config),
             config,
@@ -113,10 +113,14 @@ impl Plumbing {
     }
 
     /// Opens the services with the architecture's starting configuration
-    /// (`status`, `resume`, and `retry` take no configuration options; the
-    /// documented starting values apply).
-    fn open_with_defaults() -> Result<Self, AppError> {
-        Self::open(AppConfig::default())
+    /// (`status` takes no configuration options) plus the global
+    /// `--user-agent` value when the command transfers (`resume`, `retry`):
+    /// the documented starting values apply with that single override.
+    fn open_with_defaults(user_agent: Option<String>) -> Result<Self, AppError> {
+        Self::open(AppConfig {
+            user_agent,
+            ..AppConfig::default()
+        })
     }
 }
 
@@ -130,8 +134,11 @@ fn production_now() -> u64 {
 /// Handles the `download` command: validate the arguments, open the
 /// services, drive the batch scheduler, render controlled live progress,
 /// and finish with the per-download summary and the overall line.
-pub(super) async fn handle_download(args: &DownloadArgs) -> Result<CommandEnd, AppError> {
-    let config = crate::cli::config_from_download(args)?;
+pub(super) async fn handle_download(
+    args: &DownloadArgs,
+    user_agent: Option<String>,
+) -> Result<CommandEnd, AppError> {
+    let config = crate::cli::config_from_download(args, user_agent)?;
     crate::cli::validate_download_input(args)?;
     let plumbing = Plumbing::open(config)?;
     let request = BatchRequest {
@@ -222,7 +229,7 @@ pub(super) async fn handle_download(args: &DownloadArgs) -> Result<CommandEnd, A
 ///
 /// The listing never mutates state; it renders only stored facts.
 pub(super) fn handle_status() -> Result<CommandEnd, AppError> {
-    let plumbing = Plumbing::open_with_defaults()?;
+    let plumbing = Plumbing::open_with_defaults(None)?;
     for line in status_lines(&collect_status_rows(&plumbing.repo)?) {
         println!("{line}");
     }
@@ -287,16 +294,16 @@ fn newest_failed_extraction(repo: &Repository, id: i64) -> Result<Option<&'stati
 /// persistent state and driven through the engine within the configured
 /// file-concurrency limit. Records the engine cannot resume safely surface
 /// as that record's failed outcome — never a fake completion.
-pub(super) async fn handle_resume() -> Result<CommandEnd, AppError> {
-    let plumbing = Plumbing::open_with_defaults()?;
+pub(super) async fn handle_resume(user_agent: Option<String>) -> Result<CommandEnd, AppError> {
+    let plumbing = Plumbing::open_with_defaults(user_agent)?;
     handle_queue_work(plumbing, "resume", select_resume_candidates).await
 }
 
 /// Handles the `retry` command: failed records are requeued through the
 /// tested requeue edge, then driven like resumable work — completed records
 /// and every other unrelated record are untouched.
-pub(super) async fn handle_retry() -> Result<CommandEnd, AppError> {
-    let plumbing = Plumbing::open_with_defaults()?;
+pub(super) async fn handle_retry(user_agent: Option<String>) -> Result<CommandEnd, AppError> {
+    let plumbing = Plumbing::open_with_defaults(user_agent)?;
     handle_queue_work(plumbing, "retry", select_retry_candidates).await
 }
 

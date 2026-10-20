@@ -400,6 +400,7 @@ async fn segment_worker(
                      {range_value})",
                     context.redacted
                 ),
+                Some(response.headers()),
             ))
         }
     }
@@ -623,6 +624,7 @@ mod tests {
             etag: None,
             last_modified: None,
             effective_url: "http://mock.test/segmented.bin".to_owned(),
+            content_type: None,
         }
     }
 

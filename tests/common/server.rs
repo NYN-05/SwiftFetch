@@ -26,8 +26,8 @@ use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::{
-    HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, LOCATION,
-    RANGE,
+    HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -121,6 +121,11 @@ pub struct Behavior {
     /// how a content transformation that invalidates byte offsets is
     /// simulated.
     pub content_encoding: Option<String>,
+    /// Attach this `Content-Type` to responses; used to simulate HTML
+    /// landing pages (e.g. `text/html`) vs direct file downloads.
+    pub content_type: Option<String>,
+    /// Attach this `Retry-After` value to 429 responses.
+    pub retry_after: Option<String>,
     /// Phase 6 transient-outage countdown: the first `count` requests on
     /// this route answer `status` with a sentinel body instead of normal
     /// handling; from request `count + 1` on, the route behaves healthy.
@@ -182,6 +187,8 @@ impl Default for Behavior {
             head_content_length: None,
             get_status: None,
             content_encoding: None,
+            content_type: None,
+            retry_after: None,
             fail_first: None,
             truncate_first: None,
             range_switch_after: None,
@@ -282,6 +289,20 @@ impl Behavior {
     #[must_use]
     pub fn with_content_encoding(mut self, encoding: impl Into<String>) -> Self {
         self.content_encoding = Some(encoding.into());
+        self
+    }
+
+    /// Attach this `Content-Type` to responses.
+    #[must_use]
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Attach this `Retry-After` value (in seconds) to responses.
+    #[must_use]
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds.to_string());
         self
     }
 
@@ -700,6 +721,29 @@ fn with_encoding(
     }
 }
 
+/// Attaches optional `Content-Type` and `Retry-After` headers to a response
+/// builder; used to simulate HTML landing pages and rate-limit responses.
+fn with_optional_headers(
+    builder: hyper::http::response::Builder,
+    content_type: Option<&str>,
+    retry_after: Option<&str>,
+) -> hyper::http::response::Builder {
+    let builder = match content_type {
+        Some(ct) => builder.header(
+            CONTENT_TYPE,
+            HeaderValue::from_str(ct).expect("content-type is a valid header value"),
+        ),
+        None => builder,
+    };
+    match retry_after {
+        Some(ra) => builder.header(
+            RETRY_AFTER,
+            HeaderValue::from_str(ra).expect("retry-after is a valid header value"),
+        ),
+        None => builder,
+    }
+}
+
 /// Body handed to hyper: either exact bytes (Content-Length derived from
 /// the size hint) or a frame stream (delayed data, chunked encoding, and /
 /// or a mid-body connection drop).
@@ -926,11 +970,15 @@ async fn handle(
             let mut counters = shared.hits.lock().expect("hit counter lock");
             *counters.entry(route_key.clone()).or_insert(0) += 1;
         }
-        let response = Response::builder()
-            .status(status_code(code))
-            .header(LOCATION, location)
-            .body(TestBody::head_only(0))
-            .expect("redirect response builds");
+        let response = with_optional_headers(
+            Response::builder()
+                .status(status_code(code))
+                .header(LOCATION, location),
+            behavior.content_type.as_deref(),
+            behavior.retry_after.as_deref(),
+        )
+        .body(TestBody::head_only(0))
+        .expect("redirect response builds");
         return Ok(response);
     }
 
@@ -944,10 +992,13 @@ async fn handle(
             drop(countdown);
             let sentinel = format!("status-{status}");
             let len = sentinel.len() as u64;
-            let response = Response::builder()
-                .status(status_code(status))
-                .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
-                .expect("countdown failure response builds");
+            let response = with_optional_headers(
+                Response::builder().status(status_code(status)),
+                behavior.content_type.as_deref(),
+                behavior.retry_after.as_deref(),
+            )
+            .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+            .expect("countdown failure response builds");
             return Ok(response);
         }
     }
@@ -955,10 +1006,13 @@ async fn handle(
     if behavior.status != 200 {
         let sentinel = format!("status-{}", behavior.status);
         let len = sentinel.len() as u64;
-        let response = Response::builder()
-            .status(status_code(behavior.status))
-            .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
-            .expect("status response builds");
+        let response = with_optional_headers(
+            Response::builder().status(status_code(behavior.status)),
+            behavior.content_type.as_deref(),
+            behavior.retry_after.as_deref(),
+        )
+        .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+        .expect("status response builds");
         return Ok(response);
     }
 
@@ -983,18 +1037,25 @@ async fn handle(
     };
     if method == Method::HEAD {
         if let Some(code) = behavior.head_status {
-            return Ok(Response::builder()
-                .status(status_code(code))
-                .body(TestBody::head_only(0))
-                .expect("HEAD status-override response builds"));
+            return Ok(with_optional_headers(
+                Response::builder().status(status_code(code)),
+                behavior.content_type.as_deref(),
+                behavior.retry_after.as_deref(),
+            )
+            .body(TestBody::head_only(0))
+            .expect("HEAD status-override response builds"));
         }
-        let builder = with_encoding(
-            with_validators(
-                Response::builder().status(StatusCode::OK),
-                etag_header.as_ref(),
-                modified_header.as_ref(),
+        let builder = with_optional_headers(
+            with_encoding(
+                with_validators(
+                    Response::builder().status(StatusCode::OK),
+                    etag_header.as_ref(),
+                    modified_header.as_ref(),
+                ),
+                behavior.content_encoding.as_ref(),
             ),
-            behavior.content_encoding.as_ref(),
+            behavior.content_type.as_deref(),
+            behavior.retry_after.as_deref(),
         );
         return Ok(match &behavior.head_content_length {
             Some(HeadLength::Value(length)) => {
@@ -1023,10 +1084,13 @@ async fn handle(
     if let Some(code) = behavior.get_status {
         let sentinel = format!("status-{code}");
         let len = sentinel.len() as u64;
-        return Ok(Response::builder()
-            .status(status_code(code))
-            .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
-            .expect("GET status-override response builds"));
+        return Ok(with_optional_headers(
+            Response::builder().status(status_code(code)),
+            behavior.content_type.as_deref(),
+            behavior.retry_after.as_deref(),
+        )
+        .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+        .expect("GET status-override response builds"));
     }
     // Phase 8 segment-status override: only transfer-shaped ranges fail;
     // the probe evidence request keeps answering so segmentation can start.
@@ -1034,10 +1098,13 @@ async fn handle(
         if range_header.is_some() && !is_probe_range {
             let sentinel = format!("status-{code}");
             let len = sentinel.len() as u64;
-            return Ok(Response::builder()
-                .status(status_code(code))
-                .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
-                .expect("segment status-override response builds"));
+            return Ok(with_optional_headers(
+                Response::builder().status(status_code(code)),
+                behavior.content_type.as_deref(),
+                behavior.retry_after.as_deref(),
+            )
+            .body(TestBody::stream(sentinel, STREAM_CHUNK, None, Some(len)))
+            .expect("segment status-override response builds"));
         }
     }
     // Phase 6 mid-body-drop countdown: only GETs that reach the normal body
@@ -1160,13 +1227,17 @@ async fn handle(
         },
     };
 
-    let mut response_builder = with_encoding(
-        with_validators(
-            Response::builder().status(status_code(range_status)),
-            etag_header.as_ref(),
-            modified_header.as_ref(),
+    let mut response_builder = with_optional_headers(
+        with_encoding(
+            with_validators(
+                Response::builder().status(status_code(range_status)),
+                etag_header.as_ref(),
+                modified_header.as_ref(),
+            ),
+            behavior.content_encoding.as_ref(),
         ),
-        behavior.content_encoding.as_ref(),
+        behavior.content_type.as_deref(),
+        behavior.retry_after.as_deref(),
     );
     if let Some(header) = content_range {
         response_builder = response_builder.header(

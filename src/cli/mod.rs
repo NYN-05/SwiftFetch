@@ -21,7 +21,15 @@ use crate::error::AppError;
 /// Every field of the CLI surface maps to exactly one configuration field;
 /// defaults live in [`AppConfig::default`] so there is a single source of
 /// truth for values (CLI help text documents the same numbers).
-pub fn config_from_download(args: &DownloadArgs) -> Result<AppConfig, AppError> {
+///
+/// `user_agent` comes from the *global* `--user-agent` flag rather than
+/// any `download` option: `resume` and `retry` transfer through the same
+/// remote and must present the same identity. The application dispatch
+/// threads the global value here.
+pub fn config_from_download(
+    args: &DownloadArgs,
+    user_agent: Option<String>,
+) -> Result<AppConfig, AppError> {
     let defaults = AppConfig::default();
     let config = AppConfig {
         output_dir: args
@@ -33,6 +41,7 @@ pub fn config_from_download(args: &DownloadArgs) -> Result<AppConfig, AppError> 
         max_segments_per_file: args.max_segments.unwrap_or(defaults.max_segments_per_file),
         retry_attempts: args.retries.unwrap_or(defaults.retry_attempts),
         zip_auto_extract: !args.no_extract,
+        user_agent,
     };
     config.validate()?;
     Ok(config)
@@ -84,7 +93,7 @@ mod tests {
 
     #[test]
     fn default_arguments_map_to_architecture_defaults() {
-        let config = config_from_download(&DownloadArgs::default())
+        let config = config_from_download(&DownloadArgs::default(), None)
             .expect("default arguments must be valid");
         assert_eq!(config.output_dir, PathBuf::from("."));
         assert_eq!(config.max_concurrent_files, 3);
@@ -103,12 +112,25 @@ mod tests {
             no_extract: true,
             ..DownloadArgs::default()
         };
-        let config = config_from_download(&args).expect("values within range must be valid");
+        let config = config_from_download(&args, Some("SwiftFetch/0.15".to_owned()))
+            .expect("values within range must be valid");
         assert_eq!(config.output_dir, PathBuf::from("downloads"));
         assert_eq!(config.max_concurrent_files, 2);
         assert_eq!(config.max_segments_per_file, 8);
         assert_eq!(config.retry_attempts, 0, "0 retries is a valid choice");
         assert!(!config.zip_auto_extract);
+        assert_eq!(
+            config.user_agent.as_deref(),
+            Some("SwiftFetch/0.15"),
+            "the global --user-agent value flows into AppConfig"
+        );
+    }
+
+    #[test]
+    fn user_agent_is_absent_by_default() {
+        let config = config_from_download(&DownloadArgs::default(), None)
+            .expect("default arguments must be valid");
+        assert_eq!(config.user_agent, None, "no User-Agent by default");
     }
 
     #[test]
@@ -125,7 +147,8 @@ mod tests {
                 ..DownloadArgs::default()
             },
         ] {
-            let error = config_from_download(&args).expect_err("zero limits must be rejected");
+            let error =
+                config_from_download(&args, None).expect_err("zero limits must be rejected");
             assert_eq!(error.category(), ErrorCategory::Input);
             assert!(
                 error.message().contains("at least 1"),
@@ -137,25 +160,34 @@ mod tests {
 
     #[test]
     fn empty_and_nul_output_are_rejected() {
-        let empty = config_from_download(&DownloadArgs {
-            output: Some(String::new()),
-            ..DownloadArgs::default()
-        });
+        let empty = config_from_download(
+            &DownloadArgs {
+                output: Some(String::new()),
+                ..DownloadArgs::default()
+            },
+            None,
+        );
         assert!(empty.is_err(), "empty --output must be rejected");
 
-        let nul = config_from_download(&DownloadArgs {
-            output: Some("bad\0dir".to_owned()),
-            ..DownloadArgs::default()
-        });
+        let nul = config_from_download(
+            &DownloadArgs {
+                output: Some("bad\0dir".to_owned()),
+                ..DownloadArgs::default()
+            },
+            None,
+        );
         assert!(nul.is_err(), "NUL byte must be rejected");
     }
 
     #[test]
     fn plausible_output_path_is_accepted() {
-        let config = config_from_download(&DownloadArgs {
-            output: Some("C:/Temp/dl".to_owned()),
-            ..DownloadArgs::default()
-        })
+        let config = config_from_download(
+            &DownloadArgs {
+                output: Some("C:/Temp/dl".to_owned()),
+                ..DownloadArgs::default()
+            },
+            None,
+        )
         .expect("path without forbidden characters is valid");
         assert_eq!(config.output_dir, PathBuf::from("C:/Temp/dl"));
     }
@@ -241,7 +273,7 @@ mod tests {
         };
         assert!(validate_download_input(args).is_ok());
         assert!(
-            config_from_download(args).is_ok(),
+            config_from_download(args, None).is_ok(),
             "documented options must also produce a valid configuration"
         );
 
@@ -249,6 +281,41 @@ mod tests {
             Cli::try_parse_from(["swift-fetch", "download", "-v", "https://example.com/f"])
                 .expect("--verbose must parse from subcommand level");
         assert!(verbose.verbose);
+
+        // The global --user-agent flag: parsed at any position, carried on
+        // the root Cli for whichever command performs transfers.
+        let customized = Cli::try_parse_from([
+            "swift-fetch",
+            "--user-agent",
+            "SwiftFetch/0.15 (test)",
+            "resume",
+        ])
+        .expect("a global --user-agent must parse at root level");
+        assert_eq!(
+            customized.user_agent.as_deref(),
+            Some("SwiftFetch/0.15 (test)")
+        );
+        let subcommand_position = Cli::try_parse_from([
+            "swift-fetch",
+            "download",
+            "https://example.com/f",
+            "--user-agent",
+            "agent/1",
+        ])
+        .expect("a global --user-agent must also parse inside the subcommand");
+        assert_eq!(subcommand_position.user_agent.as_deref(), Some("agent/1"));
+
+        // Invalid values never reach dispatch: empty and control-bearing
+        // values are parse errors (exit code 2 territory).
+        assert!(Cli::try_parse_from(["swift-fetch", "resume", "--user-agent", ""]).is_err());
+        assert!(Cli::try_parse_from([
+            "swift-fetch",
+            "download",
+            "--user-agent",
+            "bad\tvalue",
+            "https://example.com/f"
+        ])
+        .is_err());
         // Dispatch itself is exercised end to end by tests/cli.rs against
         // the local mock server (unit tests must never touch the real
         // application-data directory or the network).

@@ -43,17 +43,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use reqwest::{Method, StatusCode};
 use tokio::sync::watch;
 
 use crate::archive::{determine_extract_dir, extract_zip, ExtractionConfig};
-use crate::download::http::{http_status_error, HttpClient, HttpFailure};
+use crate::download::http::{
+    bytes_look_like_html, content_type_is_html, http_status_error, landing_page_error, HttpClient,
+    HttpFailure,
+};
 use crate::download::probe::{
     parse_content_range, probe, response_meta, validate_url, ContentEncoding, ContentLength,
     ProbeResult, RangeSupport,
 };
 use crate::download::progress::Progress;
-use crate::download::retry::{classify, RetryPolicy, RetryVerdict};
+use crate::download::retry::{classify_with_delay, RetryPolicy, RetryVerdict, RETRY_AFTER_MAX};
 use crate::download::segmented::{
     download_segments, PlannedSegment, SegmentBatchEnd, SegmentContext, SegmentSpan,
     SegmentationPolicy,
@@ -573,7 +577,8 @@ pub(crate) async fn transfer_persisted(
             }
             Err(err) => err,
         };
-        match classify(&outcome) {
+        let (verdict, server_directed) = classify_with_delay(&outcome, RETRY_AFTER_MAX);
+        match verdict {
             RetryVerdict::Permanent => {
                 if let Some(record) = current_record(ctx.repo, url, output_dir)? {
                     let failure = mark_failed_record(ctx.repo, record.id, &outcome, ctx.now, None);
@@ -618,7 +623,10 @@ pub(crate) async fn transfer_persisted(
                     // diagnostic site formats through `redact_url`).
                     outcome.message(),
                 );
-                let delay = policy.delay_for(attempt);
+                // A server-directed wait (429's `Retry-After`) replaces the
+                // engine's backoff for that retry, un-jittered: the delay is
+                // the server's floor, not a bound to sample below.
+                let delay = server_directed.unwrap_or_else(|| policy.delay_for(attempt));
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
                     () = ctx.shutdown.wait() => {
@@ -1448,6 +1456,7 @@ async fn full_transfer(
                 return Err(http_status_error(
                     status,
                     format!("the remote server responded HTTP {status} for {redacted}"),
+                    Some(response.headers()),
                 ));
             }
             response
@@ -1468,6 +1477,28 @@ async fn full_transfer(
     }
     let expected = expected_size_of(meta.cl, facts.expected_size, &redacted)?;
 
+    // Bounded landing-page inspection (offset 0 only): exactly one
+    // buffered read of the restart response. Its bytes begin like HTML
+    // markup only for a landing page, so the refusal lands before anything
+    // exists on disk; the buffered bytes are otherwise handed to the
+    // stream loop as the first real content, so the inspection read never
+    // consumes or corrupts the actual download. Mid-body HTML-looking
+    // sequences at a nonzero resume offset are not evidence and are never
+    // inspected.
+    let first_chunk = match ctx.client.read_chunk(&mut response).await {
+        Ok(chunk) => chunk,
+        Err(err) => return Err(with_transfer_context(err, 0, expected, &redacted)),
+    };
+    if first_chunk
+        .as_ref()
+        .is_some_and(|bytes| bytes_look_like_html(bytes))
+    {
+        return Err(landing_page_error(
+            &redacted,
+            content_type_is_html(response.headers()),
+        ));
+    }
+
     // Only after the response proved to be content does anything exist on
     // disk; a restart reuses its own partial truncated to zero.
     let temp = match partial_path {
@@ -1483,7 +1514,7 @@ async fn full_transfer(
         segment,
         confirmed: 0,
     };
-    match stream_transfer(ctx, &mut response, temp, setup, record_id).await? {
+    match stream_transfer(ctx, &mut response, temp, first_chunk, setup, record_id).await? {
         (StreamEnd::Interrupted, _) => Ok(AttemptOutcome::Interrupted),
         (StreamEnd::Completed { total }, Some(temp)) => {
             let moved = finalize_claimed(
@@ -1802,6 +1833,7 @@ async fn resume_attempt(
             return Err(http_status_error(
                 status,
                 format!("the remote server responded HTTP {status} for {redacted}"),
+                Some(response.headers()),
             ));
         }
     }
@@ -1953,7 +1985,7 @@ async fn resume_attempt(
         segment,
         confirmed: offset,
     };
-    match stream_transfer(ctx, &mut response, temp, setup, record.id).await? {
+    match stream_transfer(ctx, &mut response, temp, None, setup, record.id).await? {
         (StreamEnd::Interrupted, _) => Ok(AttemptOutcome::Interrupted),
         (StreamEnd::Completed { total }, Some(temp)) => {
             let file_name = record.file_name.clone();
@@ -2163,6 +2195,7 @@ async fn segmented_resume_attempt(
                         "the remote server responded HTTP {status} for {redacted} (segment {})",
                         range_value
                     ),
+                    Some(response.headers()),
                 ));
             }
         }
@@ -2672,15 +2705,35 @@ struct StreamSetup {
 /// shutdown at every boundary. The partial file returns to the caller for
 /// finalization (a completed stream never drops it; an interrupted one
 /// leaves its synced bytes on disk for the next attempt).
+///
+/// `first_chunk` carries a caller-buffered read — the offset-0
+/// landing-page inspection result — and is written as real content before
+/// the loop; ranged continuations always pass `None` (mid-file bytes are
+/// never inspected).
 async fn stream_transfer(
     ctx: &Attempt<'_>,
     response: &mut reqwest::Response,
     mut partial: PartialFile,
+    first_chunk: Option<Bytes>,
     setup: StreamSetup,
     record_id: i64,
 ) -> Result<(StreamEnd, Option<PartialFile>), AppError> {
     let mut streamed: u64 = 0;
     let mut last_confirmed = setup.confirmed;
+    if let Some(chunk) = first_chunk {
+        let size = chunk.len() as u64;
+        ctx.progress.record_received(size);
+        let written = partial.write_chunk(chunk.as_ref()).await.map_err(|err| {
+            with_transfer_context(
+                err,
+                setup.confirmed + streamed,
+                setup.expected,
+                &setup.redacted,
+            )
+        })?;
+        streamed += written;
+        ctx.progress.record_written(written);
+    }
     loop {
         if ctx.shutdown.tripped() {
             let end = interrupt_stream(ctx, &mut partial, &setup, record_id, streamed).await?;
@@ -3262,6 +3315,7 @@ mod tests {
             etag: Some("\"e-1\"".to_owned()),
             last_modified: None,
             effective_url: url.to_owned(),
+            content_type: None,
         };
         match revalidate_identity(&record, &verified) {
             Identity::Verified(value) => assert_eq!(value, "\"e-1\""),

@@ -44,7 +44,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::download::http::{http_status_error, HttpClient};
+use crate::download::http::{
+    bytes_look_like_html, content_type_is_html, http_status_error, landing_page_error, HttpClient,
+};
 use crate::download::probe::{
     probe, response_meta, validate_url, ContentEncoding, ContentLength, ProbeResult,
 };
@@ -128,6 +130,7 @@ pub(crate) async fn download_sequential(
         return Err(http_status_error(
             status,
             format!("the remote server responded HTTP {status} for {redacted}"),
+            Some(response.headers()),
         ));
     }
 
@@ -146,12 +149,53 @@ pub(crate) async fn download_sequential(
     }
     let expected_size = expected_size_of(meta.cl, facts.expected_size, &redacted)?;
 
+    // Bounded landing-page inspection: exactly one buffered read — no
+    // unbounded sniffing, and it consumes nobody else's stream, because
+    // these bytes are the transfer's own first content bytes and are
+    // written as such. When they begin like HTML markup, the response was
+    // a landing page and nothing is ever written to disk: the refusal
+    // happens before the partial file exists. A server that merely
+    // mislabels a real file with an HTML media type still passes (the body
+    // does not begin like markup), because `Content-Type` alone is not
+    // proof.
+    let mut first_chunk = match client.read_chunk(&mut response).await {
+        Ok(chunk) => chunk,
+        Err(err) => {
+            return Err(with_transfer_context(err, 0, expected_size, &redacted));
+        }
+    };
+    if first_chunk
+        .as_ref()
+        .is_some_and(|bytes| bytes_look_like_html(bytes))
+    {
+        return Err(landing_page_error(
+            &redacted,
+            content_type_is_html(response.headers()),
+        ));
+    }
+
     // Only after the response proved to be content does anything exist on
     // disk: directories and the engine-owned partial file come now, so the
     // rejected paths above leave no filesystem trace at all.
     let mut partial = PartialFile::create(output_dir, &file_name).await?;
 
     let mut written: u64 = 0;
+    // The buffered inspection read is real content: write it first, so the
+    // byte account stays complete.
+    if let Some(chunk) = first_chunk.take() {
+        let size = chunk.len() as u64;
+        progress.record_received(size);
+        if let Err(err) = partial.write_chunk(chunk.as_ref()).await {
+            return Err(with_transfer_context(
+                err,
+                written,
+                expected_size,
+                &redacted,
+            ));
+        }
+        written += size;
+        progress.record_written(size);
+    }
     loop {
         // Reads and writes stay bounded to one chunk each and are counted
         // separately; both failure kinds report the byte accounting.

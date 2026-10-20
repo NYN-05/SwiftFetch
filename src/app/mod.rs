@@ -22,11 +22,15 @@ use commands_handler::{handle_download, handle_resume, handle_retry, handle_stat
 /// workflows are; `main` builds the runtime around it (current-thread,
 /// explicitly — no bootstrap macro).
 pub async fn run(cli: &Cli) -> Result<CommandEnd, AppError> {
+    // The global `--user-agent` value is intentionally threaded to every
+    // command that performs transfers (download, resume, retry), so the
+    // remote sees one consistent identity; `status` performs no HTTP.
+    let user_agent = cli.user_agent.clone();
     match &cli.command {
-        Commands::Download(args) => handle_download(args).await,
+        Commands::Download(args) => handle_download(args, user_agent).await,
         Commands::Status => handle_status(),
-        Commands::Resume => handle_resume().await,
-        Commands::Retry => handle_retry().await,
+        Commands::Resume => handle_resume(user_agent).await,
+        Commands::Retry => handle_retry(user_agent).await,
     }
 }
 

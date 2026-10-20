@@ -40,6 +40,19 @@ pub(crate) enum RetryVerdict {
     Permanent,
 }
 
+/// The largest server-suggested wait (`Retry-After`) the bounded policy
+/// will honor automatically for a 429 response.
+///
+/// A rate-limit wait is server-directed, so its shape differs from the
+/// engine's own backoff: it retries after *exactly* the requested delay
+/// (no jitter below the server's floor), but only while that wait stays
+/// within this ceiling — "valid and consistent with the configured retry
+/// limits". An unbounded server wait would violate the project's
+/// no-unbounded-waits rule and freeze a worker slot for arbitrary times;
+/// anything above the ceiling is a permanent failure whose message names
+/// the suggested wait, for a deliberate manual `retry` later.
+pub(crate) const RETRY_AFTER_MAX: Duration = Duration::from_secs(60);
+
 /// Reads the hidden diagnostic chain of a typed error and classifies it.
 ///
 /// The chain is walked structurally: an [`HttpFailure`] marker names either
@@ -47,23 +60,43 @@ pub(crate) enum RetryVerdict {
 /// wrapped `reqwest::Error` is recognized as transport by its own flags.
 /// Anything unmarked is permanent — the bounded policy must never
 /// extrapolate "maybe transient" onto an unclassified failure.
-pub(crate) fn classify(err: &AppError) -> RetryVerdict {
+///
+/// `max_server_wait` bounds how large a server-directed `Retry-After` wait
+/// may be for a 429 to still classify as transient; larger suggested waits
+/// are permanent, with the wait named in the failure's message.
+pub(crate) fn classify_with_delay(
+    err: &AppError,
+    max_server_wait: Duration,
+) -> (RetryVerdict, Option<Duration>) {
     // Shutdown is never an error to retry: stopping *is* the requested work.
     if err.category() == ErrorCategory::Cancelled {
-        return RetryVerdict::Permanent;
+        return (RetryVerdict::Permanent, None);
     }
     if let Some(marker) = chained::<HttpFailure>(err) {
         return match marker.status() {
+            // A 429 that names a valid numeric wait retries after exactly
+            // that wait (the server's floor, honored verbatim), while the
+            // wait itself is within the configured bound.
+            Some(429)
+                if marker
+                    .retry_after()
+                    .is_some_and(|secs| Duration::from_secs(secs) <= max_server_wait) =>
+            {
+                (
+                    RetryVerdict::Transient,
+                    marker.retry_after().map(Duration::from_secs),
+                )
+            }
             // Server-side availability problems are the canonical transient
             // set; every other named answer is a permanent fact about the
             // URL (4xx) or the request that produced it.
-            Some(status) if (500..=599).contains(&status) => RetryVerdict::Transient,
-            Some(_) => RetryVerdict::Permanent,
-            None => RetryVerdict::Transient,
+            Some(status) if (500..=599).contains(&status) => (RetryVerdict::Transient, None),
+            Some(_) => (RetryVerdict::Permanent, None),
+            None => (RetryVerdict::Transient, None),
         };
     }
     if let Some(reqwest_error) = chained::<reqwest::Error>(err) {
-        return if reqwest_error.is_timeout()
+        let verdict = if reqwest_error.is_timeout()
             || reqwest_error.is_connect()
             || reqwest_error.is_body()
             || reqwest_error.is_decode()
@@ -72,8 +105,15 @@ pub(crate) fn classify(err: &AppError) -> RetryVerdict {
         } else {
             RetryVerdict::Permanent
         };
+        return (verdict, None);
     }
-    RetryVerdict::Permanent
+    (RetryVerdict::Permanent, None)
+}
+
+/// Reads the hidden diagnostic chain of a typed error and classifies it,
+/// with the module's standard bound on server-directed waits.
+pub(crate) fn classify(err: &AppError) -> RetryVerdict {
+    classify_with_delay(err, RETRY_AFTER_MAX).0
 }
 
 /// Walks `err`'s hidden source chain looking for `T`.
@@ -180,6 +220,7 @@ mod tests {
         crate::download::http::http_status_error(
             code,
             format!("the remote server responded HTTP {code} for /x"),
+            None,
         )
     }
 
@@ -361,5 +402,71 @@ mod tests {
             HttpFailure::transport().with_reason(std::io::Error::other("connection reset by peer"));
         let reason = (marker.source()).and_then(|source| source.downcast_ref::<std::io::Error>());
         assert!(reason.is_some(), "the reason hop survives in the chain");
+    }
+
+    // -- 429 with Retry-After ------------------------------------------------------------
+
+    /// A genuine 429 as the HTTP layer emits it, with the given raw value.
+    fn rate_limited_error(retry_after: Option<&str>) -> AppError {
+        let headers = retry_after.map(|value| {
+            let mut map = reqwest::header::HeaderMap::new();
+            map.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("test header value"),
+            );
+            map
+        });
+        let code = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        crate::download::http::http_status_error(
+            code,
+            format!("the remote server responded HTTP {code} for /x"),
+            headers.as_ref(),
+        )
+    }
+
+    #[test]
+    fn a_429_with_a_bounded_retry_after_is_transient_with_that_exact_delay() {
+        let (verdict, delay) = classify_with_delay(&rate_limited_error(Some("12")), RETRY_AFTER_MAX);
+        assert_eq!(verdict, RetryVerdict::Transient);
+        assert_eq!(
+            delay,
+            Some(Duration::from_secs(12)),
+            "the server's floor is honored verbatim, not jittered"
+        );
+
+        // The ceiling itself stays acceptable.
+        let at_ceiling = RETRY_AFTER_MAX.as_secs().to_string();
+        let (verdict, delay) =
+            classify_with_delay(&rate_limited_error(Some(&at_ceiling)), RETRY_AFTER_MAX);
+        assert_eq!(verdict, RetryVerdict::Transient);
+        assert_eq!(delay, Some(RETRY_AFTER_MAX));
+    }
+
+    #[test]
+    fn a_retry_after_above_the_bound_is_a_permanent_failure() {
+        for bound in [RETRY_AFTER_MAX, Duration::from_secs(5)] {
+            let over = bound.as_secs() + 1;
+            let (verdict, delay) =
+                classify_with_delay(&rate_limited_error(Some(&over.to_string())), bound);
+            assert_eq!(
+                verdict, RetryVerdict::Permanent,
+                "a {over}s server wait must not freeze a worker slot automatically"
+            );
+            assert_eq!(delay, None, "no delay is spent on a permanent verdict");
+        }
+    }
+
+    #[test]
+    fn a_429_without_a_usable_retry_after_stays_permanent() {
+        // No header at all: the Phase 6 contract holds.
+        assert_eq!(
+            classify_with_delay(&rate_limited_error(None), RETRY_AFTER_MAX),
+            (RetryVerdict::Permanent, None)
+        );
+        // HTTP-date form: no canonical wait, no automatic retry.
+        assert_eq!(
+            classify_with_delay(&rate_limited_error(Some("Wed, 21 Oct 2026 07:28:00 GMT")), RETRY_AFTER_MAX),
+            (RetryVerdict::Permanent, None)
+        );
     }
 }

@@ -36,6 +36,21 @@ pub struct Cli {
         help = "Enable detailed diagnostic logging on stderr"
     )]
     pub verbose: bool,
+
+    /// Custom `User-Agent` header value for every HTTP request the sends
+    /// through, whichever command performs them (`download`, `resume`,
+    /// `retry`). The value cannot be empty and must contain only printable
+    /// ASCII characters (a valid HTTP header value); no browser-impersonation
+    /// defaults are invented — absent the flag no such header is sent.
+    #[arg(
+        long = "user-agent",
+        global = true,
+        value_name = "STRING",
+        value_parser = crate::config::valid_user_agent,
+        help = "Custom User-Agent header value sent with every HTTP request \
+                [default: none]"
+    )]
+    pub user_agent: Option<String>,
 }
 
 /// The exact command surface required by the project.

@@ -36,7 +36,7 @@ use bytes::Bytes;
 
 use crate::error::{AppError, ErrorCategory};
 use crate::logging::redact_url;
-use reqwest::header::{HeaderValue, ACCEPT_ENCODING, IF_RANGE, RANGE};
+use reqwest::header::{HeaderValue, ACCEPT_ENCODING, IF_RANGE, RANGE, USER_AGENT};
 use reqwest::{Method, StatusCode, Url};
 
 /// Connection timeout mandated by `DOCS/architecture.md` §6.
@@ -98,11 +98,20 @@ impl Default for HttpTimeouts {
 pub(crate) struct HttpClient {
     client: reqwest::Client,
     timeouts: HttpTimeouts,
+    /// Optional `User-Agent` header value applied to every request.
+    /// `None` means no custom header (the HTTP library's default).
+    user_agent: Option<String>,
 }
 
 impl HttpClient {
     /// Builds the configured client (connection reuse via reqwest's pool).
-    pub(crate) fn new(timeouts: HttpTimeouts) -> Result<Self, AppError> {
+    ///
+    /// `user_agent`, when `Some`, is attached as the `User-Agent` header on
+    /// every request through `send` / `send_with_validator`.
+    pub(crate) fn new(
+        timeouts: HttpTimeouts,
+        user_agent: Option<String>,
+    ) -> Result<Self, AppError> {
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .redirect(reqwest::redirect::Policy::limited(REDIRECT_LIMIT))
@@ -114,12 +123,16 @@ impl HttpClient {
                 )
                 .with_source(err)
             })?;
-        Ok(Self { client, timeouts })
+        Ok(Self {
+            client,
+            timeouts,
+            user_agent,
+        })
     }
 
-    /// The production default client.
+    /// The production default client (no custom `User-Agent`).
     pub(crate) fn default_client() -> Result<Self, AppError> {
-        Self::new(HttpTimeouts::default())
+        Self::new(HttpTimeouts::default(), None)
     }
 
     /// One request through the shared client, with `Accept-Encoding:
@@ -158,6 +171,13 @@ impl HttpClient {
             .client
             .request(method, url.as_str())
             .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        if let Some(agent) = &self.user_agent {
+            builder = builder.header(
+                USER_AGENT,
+                HeaderValue::from_str(agent)
+                    .expect("the configured User-Agent is a valid header value"),
+            );
+        }
         if let Some(range) = range {
             builder = builder.header(
                 RANGE,
@@ -214,9 +234,148 @@ impl HttpClient {
 /// Builds the user-facing HTTP-status failure: the typed category and
 /// message plus a classification marker in the hidden source (Phase 6
 /// retry classification reads the marker, not the message).
-pub(crate) fn http_status_error(status: StatusCode, message: String) -> AppError {
+///
+/// `headers`, when available, is inspected for a `Content-Type` that looks
+/// like HTML (a likely landing page instead of a direct file link) and for
+/// a numeric `Retry-After` on 429 responses. Neither is treated as
+/// definitive proof: the message uses cautious wording ("may be", "appears
+/// to be"), and a non-numeric `Retry-After` (HTTP-date form) is never
+/// interpreted into a wait.
+pub(crate) fn http_status_error(
+    status: StatusCode,
+    message: String,
+    headers: Option<&reqwest::header::HeaderMap>,
+) -> AppError {
+    let enhanced = status_specific_message(status, &message, headers);
+    // The base message is log-safe by construction (redacted URL), so one
+    // structured warn line gives the incident a searchable status record.
+    tracing::warn!("{enhanced}");
+    let mut marker = HttpFailure::with_status(status.as_u16());
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(seconds) = retry_after_seconds(headers) {
+            marker = marker.with_retry_after(seconds);
+        }
+    }
+    AppError::new(ErrorCategory::Http, enhanced).with_source(marker)
+}
+
+/// The numeric `Retry-After` value of a response, in seconds.
+///
+/// Only the delay-seconds form is read; the HTTP-date form carries no
+/// canonical wait for the bounded policy to honor, and is therefore left
+/// unparsed (`None`).
+fn retry_after_seconds(headers: Option<&reqwest::header::HeaderMap>) -> Option<u64> {
+    let value = headers?.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse::<u64>().ok()
+}
+
+/// Produces a status-specific user-facing message.
+///
+/// Client errors (4xx) are permanent facts about the URL; server errors
+/// (5xx) are transient availability problems. HTML `Content-Type` on an
+/// error response suggests a landing page rather than a direct file link.
+fn status_specific_message(
+    status: StatusCode,
+    base: &str,
+    headers: Option<&reqwest::header::HeaderMap>,
+) -> String {
+    let html_note = html_landing_page_note(headers);
+    let status_note = match status.as_u16() {
+        401 => " authentication is required; check credentials or permissions for this URL".to_owned(),
+        403 => " access is forbidden; the server refuses this URL (it may be bot-protected, require permissions, or not allow direct downloads)".to_owned(),
+        404 => " not found; check the URL (the file may have been removed or moved)".to_owned(),
+        429 => match retry_after_seconds(headers) {
+            Some(seconds) => {
+                format!(" rate limited; the server suggests retrying after {seconds} seconds")
+            }
+            None => " rate limited; try again later".to_owned(),
+        },
+        code if (500..=599).contains(&code) => {
+            " server error; this is a transient failure and may be retried automatically".to_owned()
+        }
+        _ => String::new(),
+    };
+    format!("{base}{status_note}{html_note}")
+}
+
+/// Cautious note when the response `Content-Type` looks like HTML.
+///
+/// `Content-Type` alone is not definitive proof of a landing page — some
+/// file servers mislabel content — so the wording says "may be" rather
+/// than asserting it.
+fn html_landing_page_note(headers: Option<&reqwest::header::HeaderMap>) -> String {
+    let Some(headers) = headers else {
+        return String::new();
+    };
+    let Some(content_type) = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return String::new();
+    };
+    let lowered = content_type.to_lowercase();
+    if lowered.contains("text/html") || lowered.contains("application/xhtml") {
+        return "; the response appears to be an HTML page rather than a file download — this URL may be a landing page, not a direct file link."
+            .to_owned();
+    }
+    String::new()
+}
+
+/// Whether a response's `Content-Type` claims an HTML media type.
+///
+/// A header claim is only a lead ("not definitive proof"): the transfer
+/// engine pairs this signal with the bounded body inspection in
+/// [`bytes_look_like_html`] before refusing a 200 response as a landing
+/// page, and a mislabeled non-HTML body downloads normally.
+pub(crate) fn content_type_is_html(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(media_type_is_html)
+}
+
+/// Whether a media-type string claims an HTML media type (`text/html` or
+/// an XHTML type, prefix-tolerant of parameters).
+pub(crate) fn media_type_is_html(media_type: &str) -> bool {
+    let lowered = media_type.to_lowercase();
+    lowered.contains("text/html") || lowered.contains("application/xhtml")
+}
+
+/// Whether raw bytes begin like HTML markup at offset 0.
+///
+/// Anchored at the very start of the body (a UTF-8 BOM or ASCII
+/// whitespace prefix is tolerated), case-insensitive, and deliberately
+/// narrow: `<?xml` is *not* a marker, because an XML document can be a
+/// legitimate file, and only HTML documents open with these signals.
+pub(crate) fn bytes_look_like_html(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let bytes = bytes.trim_ascii_start();
+    ["<!doctype", "<html", "<!--"].iter().any(|marker| {
+        bytes.len() >= marker.len() && bytes[..marker.len()].eq_ignore_ascii_case(marker.as_bytes())
+    })
+}
+
+/// The refusal emitted when a transfer's `200 OK` body begins like HTML,
+/// before any byte reaches disk. The message names the HTTP status and,
+/// when the server claimed it, the HTML media type — safe metadata only.
+///
+/// The category alone carries no transient marker, so this failure is
+/// permanent: retrying an unchanged landing page would be futile, and a
+/// deliberate `retry` remains available without any promise of access.
+pub(crate) fn landing_page_error(redacted: &str, content_type_html: bool) -> AppError {
+    let claim = if content_type_html {
+        ", and the server claimed an HTML media type"
+    } else {
+        ""
+    };
+    let message = format!(
+        "the transfer of {redacted} received what looks like an HTML page \
+         instead of the file: the server answered HTTP 200 and the response \
+         body begins with HTML markup{claim}; this URL probably serves a \
+         landing page rather than a direct file link — use the link that \
+         points at the file itself"
+    );
     AppError::new(ErrorCategory::Http, message)
-        .with_source(HttpFailure::with_status(status.as_u16()))
 }
 
 /// Builds a transport-level HTTP failure (timeouts, connection loss,
@@ -242,6 +401,11 @@ fn transport_failure_error(message: String, reason: Option<reqwest::Error>) -> A
 #[derive(Debug)]
 pub(crate) struct HttpFailure {
     status: Option<u16>,
+    /// `Retry-After` in whole seconds, parsed only when the server supplied
+    /// a valid numeric value on a 429 response. This is the server's own
+    /// suggested wait, carried for the bounded retry policy (429 responses
+    /// naming such a wait retry after it; see `retry.rs`).
+    retry_after: Option<u64>,
     reason: Option<Box<dyn StdError + Send + Sync>>,
 }
 
@@ -250,6 +414,7 @@ impl HttpFailure {
     pub(crate) fn transport() -> Self {
         Self {
             status: None,
+            retry_after: None,
             reason: None,
         }
     }
@@ -258,8 +423,15 @@ impl HttpFailure {
     pub(crate) fn with_status(status: u16) -> Self {
         Self {
             status: Some(status),
+            retry_after: None,
             reason: None,
         }
+    }
+
+    /// Attaches a server-suggested wait in seconds to the marker.
+    pub(crate) fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
 
     /// Keeps the original diagnostic error behind the marker.
@@ -271,6 +443,11 @@ impl HttpFailure {
     /// The HTTP status when the failure came from one.
     pub(crate) fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    /// The server-suggested wait, when one was validly supplied.
+    pub(crate) fn retry_after(&self) -> Option<u64> {
+        self.retry_after
     }
 }
 
@@ -319,12 +496,14 @@ pub(crate) fn http_error(err: reqwest::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        http_status_error, transport_failure_error, HttpClient, HttpFailure, HttpTimeouts,
+        bytes_look_like_html, content_type_is_html, http_status_error, media_type_is_html,
+        retry_after_seconds, transport_failure_error, HttpClient, HttpFailure, HttpTimeouts,
         BODY_IDLE_TIMEOUT, CONNECT_TIMEOUT, HEADER_TIMEOUT,
     };
     use crate::common::fixture::Fixture;
     use crate::common::server::{Behavior, MockServer};
     use crate::error::{AppError, ErrorCategory};
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use reqwest::{Method, StatusCode};
     use std::error::Error as _;
     use std::time::{Duration, Instant};
@@ -361,6 +540,7 @@ mod tests {
         let status_err = http_status_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the remote server responded HTTP 503 for /x".to_owned(),
+            None,
         );
         assert_eq!(status_err.category(), ErrorCategory::Http);
         let marker = status_err
@@ -412,11 +592,14 @@ mod tests {
         // 250 ms metadata budget, yet within the 5 s idle budget.
         server.mount_route("/slow-body", Behavior::default().with_delay_body_ms(200));
         let url = server.url("/slow-body");
-        let client = HttpClient::new(HttpTimeouts {
-            connect: Duration::from_secs(5),
-            metadata: Duration::from_millis(250),
-            body_idle: Duration::from_secs(5),
-        })
+        let client = HttpClient::new(
+            HttpTimeouts {
+                connect: Duration::from_secs(5),
+                metadata: Duration::from_millis(250),
+                body_idle: Duration::from_secs(5),
+            },
+            None,
+        )
         .expect("custom timeouts build a client");
 
         let send_started = Instant::now();
@@ -460,11 +643,14 @@ mod tests {
         // poll stalls for the whole delay: 900 ms behind a 250 ms budget.
         server.mount_route("/stalled", Behavior::default().with_delay_body_ms(900));
         let url = server.url("/stalled");
-        let client = HttpClient::new(HttpTimeouts {
-            connect: Duration::from_secs(5),
-            metadata: Duration::from_secs(5),
-            body_idle: Duration::from_millis(250),
-        })
+        let client = HttpClient::new(
+            HttpTimeouts {
+                connect: Duration::from_secs(5),
+                metadata: Duration::from_secs(5),
+                body_idle: Duration::from_millis(250),
+            },
+            None,
+        )
         .expect("custom timeouts build a client");
 
         let mut response = client
@@ -495,6 +681,236 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "the read must fail bounded, not wait out the server delay (took {elapsed:?})"
+        );
+    }
+
+    // -- User-Agent configuration --------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_configured_user_agent_is_sent_on_every_request() {
+        let mut server = MockServer::start().await;
+        server.mount_route("/ua", Behavior::default());
+        let client = HttpClient::new(
+            HttpTimeouts::default(),
+            Some("swiftfetch-test/1.0 (unit-test)".to_owned()),
+        )
+        .expect("a client with a User-Agent builds");
+
+        client
+            .send(
+                Method::GET,
+                &server.url("/ua").parse().expect("test url"),
+                None,
+            )
+            .await
+            .expect("the request completes");
+
+        let requests = server.requests();
+        let sent = requests.last().expect("the request was recorded");
+        assert_eq!(
+            sent.headers.get("user-agent").map(String::as_str),
+            Some("swiftfetch-test/1.0 (unit-test)"),
+            "the configured User-Agent is carried verbatim: {:?}",
+            sent.headers
+        );
+        // Byte correctness of the answer stays intact beside identity tests.
+        assert_eq!(sent.path, "/ua", "the request reached the asked route");
+    }
+
+    #[tokio::test]
+    async fn no_user_agent_header_is_sent_without_configuration() {
+        let mut server = MockServer::start().await;
+        server.mount_route("/plain", Behavior::default());
+        let client = HttpClient::default_client().expect("the default client builds");
+
+        client
+            .send(
+                Method::GET,
+                &server.url("/plain").parse().expect("test url"),
+                None,
+            )
+            .await
+            .expect("the request completes");
+
+        let requests = server.requests();
+        let sent = requests.last().expect("the request was recorded");
+        assert!(
+            !sent.headers.contains_key("user-agent"),
+            "absent --user-agent, no User-Agent header is sent (no impersonation by default): {:?}",
+            sent.headers
+        );
+    }
+
+    // -- status-specific diagnostics and Retry-After --------------------------------------
+
+    fn retry_after_map(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(value).expect("test Retry-After value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn status_messages_name_the_common_failures_with_next_steps() {
+        let base = "the remote server responded HTTP {code} for http://h/f".to_owned();
+        let cases: [(u16, &[&str]); 4] = [
+            (401, &["401", "authentication"]),
+            (403, &["403", "forbidden", "bot-protected"]),
+            (404, &["404", "not found"]),
+            (521, &["521", "server error"]),
+        ];
+        for (code, needles) in cases {
+            let status = StatusCode::from_u16(code).expect("test status");
+            let error = http_status_error(status, base.replace("{code}", &code.to_string()), None);
+            for needle in needles {
+                assert!(
+                    error.message().contains(needle),
+                    "the {code} message must contain {needle:?}: {}",
+                    error.message()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_429_message_names_a_valid_retry_after_wait() {
+        let status = StatusCode::TOO_MANY_REQUESTS;
+        let headers = retry_after_map("12");
+        let error = http_status_error(
+            status,
+            "the remote server responded HTTP 429 for http://h/f".to_owned(),
+            Some(&headers),
+        );
+        assert!(
+            error.message().contains("retrying after 12 seconds"),
+            "a numeric Retry-After is reported: {}",
+            error.message()
+        );
+        let marker = error
+            .source()
+            .and_then(|source| source.downcast_ref::<HttpFailure>())
+            .expect("the status failure carries its marker");
+        assert_eq!(marker.retry_after(), Some(12));
+    }
+
+    #[test]
+    fn a_non_numeric_retry_after_is_never_interpreted() {
+        let status = StatusCode::TOO_MANY_REQUESTS;
+        let headers = retry_after_map("Wed, 21 Oct 2026 07:28:00 GMT");
+        let error = http_status_error(
+            status,
+            "the remote server responded HTTP 429 for http://h/f".to_owned(),
+            Some(&headers),
+        );
+        assert!(
+            error.message().contains("try again later"),
+            "a non-numeric Retry-After is not phrased as seconds: {}",
+            error.message()
+        );
+        let marker = error
+            .source()
+            .and_then(|source| source.downcast_ref::<HttpFailure>())
+            .expect("the marker exists");
+        assert_eq!(
+            marker.retry_after(),
+            None,
+            "an HTTP-date Retry-After carries no parsed wait"
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_parses_numerics_only() {
+        assert_eq!(retry_after_seconds(Some(&retry_after_map("7"))), Some(7));
+        assert_eq!(retry_after_seconds(Some(&retry_after_map(" 7 "))), Some(7));
+        assert_eq!(
+            retry_after_seconds(Some(&retry_after_map("Wed, 21 Oct 2026 07:28:00 GMT"))),
+            None
+        );
+        assert_eq!(retry_after_seconds(Some(&retry_after_map("-3"))), None);
+        assert_eq!(retry_after_seconds(None), None);
+    }
+
+    // -- landing-page evidence ------------------------------------------------------------
+
+    #[test]
+    fn html_media_type_detection_is_prefix_tolerant() {
+        for accepted in ["text/html", "text/html; charset=utf-8", "application/xhtml+xml"] {
+            assert!(
+                media_type_is_html(accepted),
+                "{accepted} claims HTML"
+            );
+        }
+        for rejected in [
+            "application/octet-stream",
+            "application/json",
+            "image/png",
+            "text/csv",
+            "text/htmlish-pretend",
+        ] {
+            assert!(
+                !media_type_is_html(rejected),
+                "{rejected} does not claim HTML"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert!(content_type_is_html(&headers));
+        assert!(!content_type_is_html(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn html_markup_evidence_is_anchored_and_case_insensitive() {
+        for markup in [
+            "<!DOCTYPE html><html>",
+            "<!doctype html>",
+            "<html lang=\"en\">",
+            "<!-- server comment --><!DOCTYPE html>",
+            &format!("﻿<html>"),
+            "\n   <!doctype html>",
+        ] {
+            assert!(
+                bytes_look_like_html(markup.as_bytes()),
+                "{markup:?} begins like HTML"
+            );
+        }
+        for plain in [
+            "PK\x03\x04zip-bytes",
+            "\x7fELF binary",
+            "#!/usr/bin/env python",
+            "#import <Foundation/Foundation.h>",
+            "%PDF-1.7",
+            "hello world",
+            "<xhtmlist-of-names>",
+        ] {
+            assert!(
+                !bytes_look_like_html(plain.as_bytes()),
+                "{plain:?} must not be taken for HTML"
+            );
+        }
+    }
+
+    #[test]
+    fn a_landing_page_refusal_is_permanent_and_self_explanatory() {
+        let with_claim = super::landing_page_error("http://h/landing", true);
+        assert_eq!(with_claim.category(), ErrorCategory::Http);
+        assert!(
+            with_claim.message().contains("landing page")
+                && with_claim.message().contains("direct file link")
+                && with_claim.message().contains("HTTP 200")
+                && with_claim.message().contains("HTML media type"),
+            "the refusal explains what happened and the next step: {}",
+            with_claim.message()
+        );
+        let without_claim = super::landing_page_error("http://h/landing", false);
+        assert!(
+            !without_claim.message().contains("HTML media type"),
+            "the media-type claim is reported only when the server declared it: {}",
+            without_claim.message()
         );
     }
 }
