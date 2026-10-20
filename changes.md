@@ -1959,6 +1959,79 @@ file-writer + 2 repository + 1 batch); mock_server 24 → 30 (+6).
   phase-boundary law) pending the owner's explicit decision on a Phase 9
   repair.
 
+## Phase 13 — Performance and Resource Validation (v0.15.0)
+
+- **Commit:** this entry commits with the phase work (the entry cannot
+  know its own hash); the post-commit verification addendum below records
+  it together with the fresh-clone gate results.
+- **Outcome:** Phase 13 exit gate met (working tree, native Windows).
+  Performance and resource use are now measured against a sequential
+  baseline with repeatable, documented commands: every scenario drives the
+  real engine and storage layers in-process against the controlled local
+  mock server, verifies each finalized fixture byte-for-byte, and records
+  elapsed time, throughput, request count, process CPU time, and working-set
+  memory. Conservative provisional defaults (3 concurrent files / 4 segments
+  per file) are retained — on this loopback host the longest downloads are
+  faster without segmentation, so no speed multiplier is claimed beyond this
+  machine's measurement. All benchmarks are `#[ignore]`d long measurements
+  (repeat with `cargo test --bin swift-fetch -- --ignored --nocapture`);
+  one cheap harness sanity check runs in every `cargo test`.
+- **Dependencies added (test-only):**
+  `windows-sys 0.61.2` `[dev-dependencies]` gains the
+  `Win32_System_Threading` feature so the benchmark harness can sample this
+  process's CPU time via `GetProcessTimes` (no new crate; Psapi.lib for the
+  working-set sample is the MSVC toolchain's in-box import library). The
+  crate stays dev-only: plain `cargo build` re-locks the product/no-new-dep
+  boundary every run (ADR-0003 / ADR-0013 discipline).
+- **Code changes:**
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | version `0.14.0` → `0.15.0`; `windows-sys` dev-dep gains `Win32_System_Threading` (benchmark CPU measurement only, never product-linked) |
+| `Cargo.lock` | regenerated: version line + windows-sys feature resolution; committed per the standing rule |
+| `src/main.rs` | declares `#[cfg(test)] mod benchmarks;` (test-only inclusion, same pattern as `common`); no non-test impact |
+| `src/benchmarks.rs` | NEW. Process-level measurement helpers (`sample_process` for CPU+working set via `GetProcessTimes`/`Psapi`, `assert_file_matches_fixture` for bounded byte-exact verification, `scenario_header`/`run_line` for reproducible output), one `#[ignore]`d harness sanity check plus five `#[ignore]`d long measurements: `sequential_baseline_benchmark` (64 MiB forced-sequential × 3 repeats), `segment_count_comparison_benchmark` (64 MiB, max_segments {1,2,4,8}), `multiple_file_concurrency_benchmark` (8 files × 16 MiB, limits {1,3,8}), `large_file_resource_bound_benchmark` (128 MiB × 3 repeats with the working-set bound below one file copy), and `long_url_list_stress_benchmark` (200 URLs × 4 KiB from a `--url-file` list, limit 4). Every scenario asserts byte-exact final files, expected request counts, bounded concurrency (`peak_active_files <= limit`), and working-set memory far below a whole-file copy; throughput/CPU/requests/memory are printed per run |
+
+- **Behavior contract (Phase 13):**
+  - Baselines are sequential (forced `max_segments = 1`); segment counts only compare when range support is proven (it is, for the eligible fixtures).
+  - File concurrency never exceeds the configured limit (mock-observed `peak_active_files` equals the limit in every measured run — bound by construction, not asserted by construction alone).
+  - Memory stays bounded: a 128 MiB transfer's working-set delta is under 6 MiB, and a 200-URL list stays under 100 MiB.
+  - Every downloaded fixture is verified byte-for-byte against its deterministic `Fixture` bytes (streaming scan, no whole-file materialization in the harness).
+  - No universal speed claim: results describe this machine's loopback mock only; the default 4-segment policy is slower here than sequential, which is exactly why evidence rather than assumption governs defaults.
+
+- **Disclosures:**
+  - *Pre-existing failures are unchanged.* Every full `cargo test --no-fail-fast` run reports the same seven inherited Phase 9-lineage segmented-recovery failures (identical names and panic lines as the Phase 10/11/12 records). Phase 13 touches none of `src/download/resume.rs`, per the phase-boundary law; the suite counts below carry exactly those seven and nothing new.
+  - *CPU/memory sampling is Windows-native.* `GetProcessTimes`/`Psapi` are gated behind `#[cfg(windows)]`; on a non-Windows platform the harness reports "not measured" instead of failing.
+  - *Measurements are harness-inclusive:* the in-process mock server shares the process with the engine being measured, so CPU and working-set figures include both sides of the loopback exchange. They describe relative cost, not an absolute engine budget.
+  - *Timing is approximate:* mocked server delays plus OS scheduling mean run-to-run throughput varies; assertions are on correctness and bounds, not on absolute speedups.
+
+- **Verification - actual results (all run on Windows, working tree v0.15.0):**
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | pass, exit 0 (swift-fetch v0.15.0) |
+| plain `cargo build` (feature-unification check; product deps unchanged) | pass, exit 0 |
+| `cargo test --no-fail-fast` (unit target) | **277 passed / 7 failed** (44.7 s) - exactly the seven inherited Phase 9-lineage failures named in the Phase 10/11/12 records; nothing new |
+| `cargo test --no-fail-fast` (`tests/cli.rs`) | **24 passed / 0 failed** |
+| `cargo test --no-fail-fast` (`tests/fixtures.rs`) | **15 passed / 0 failed** |
+| `cargo test --no-fail-fast` (`tests/mock_server.rs`) | **33 passed / 0 failed** |
+| `cargo test --bin swift-fetch -- --ignored --nocapture` (benchmarks) | **5 passed / 0 failed** - every scenario measured; see the per-scenario records below |
+
+Per-scenario observed results (loopback mock, `Release` not used; debug profile, repeat counts as noted):
+
+- `sequential_baseline_benchmark`: 64 MiB forced-sequential × 3 repeats — 38.2 / 28.1 / 25.9 MiB/s; aggregate 201,326,592 bytes in 6.422 s (29.9 MiB/s); each repeat makes exactly 3 requests (probe HEAD + ranged GET + transfer GET); byte-exact every repeat; CPU ~1.5–1.7 s per repeat; memory delta ≤ ~4.2 MiB.
+- `segment_count_comparison_benchmark`: 64 MiB × max_segments {1, 2, 4, 8} — sequential 45.0 MiB/s, 2 segments 33.5 MiB/s, 4 segments (default) 27.4 MiB/s, 8 segments 25.8 MiB/s; no speedup on this loopback host (sequential is fastest); request counts match plan+probe (3/4/6/10); all byte-exact.
+- `multiple_file_concurrency_benchmark`: 8 files × 16 MiB × limits {1, 3, 8} — peak_active_files == limit in every run (1 / 3 / 8); mock-observed `peak_active_gets` == limit; all files complete, zero failures; throughput 42.7 / 26.6 / 24.2 MiB/s (single-threaded is fastest on loopback; concurrency adds scheduling cost here).
+- `large_file_resource_bound_benchmark`: 128 MiB × 3 repeats — 41.9 / 48.0 / 45.9 MiB/s; memory delta ≤ ~5.1 MiB for a 128 MiB file (bounded streaming, no whole-file buffering); 6 requests each repeat; byte-exact.
+- `long_url_list_stress_benchmark`: 200 URLs × 4 KiB from `--url-file`, limit 4 — peak_active_files == 4; all 200 complete, zero failures; 600 requests; memory delta ~2.4 MiB; byte-exact.
+
+- **Scope-control notes:**
+  - No new product dependencies; no engine, storage, CLI, or scheduling logic changed; nothing from a later phase (Phase 14 documentation) is introduced.
+  - The benchmarks measure the transfer only (extraction disabled), so no ZIP surface is exercised.
+  - The `dead_code` waiver on `src/benchmarks.rs` names the ignored long measurements; the sanity check keeps the harness load-bearing for `cargo test`.
+
+
 ## Phase 12: Windows resilience and failure hardening (v0.14.0)
 
 - **Commit:** this entry commits with the phase work (the entry cannot

@@ -34,6 +34,12 @@ mod storage;
 #[path = "../tests/common/mod.rs"]
 pub(crate) mod common;
 
+/// Phase 13 performance benchmarks: long-running, ignored measurements that
+/// drive the real engine and storage layers in-process. Excluded from
+/// non-test builds like every other `#[cfg(test)]` module.
+#[cfg(test)]
+mod benchmarks;
+
 fn main() {
     let cli = cli::Cli::parse();
     logging::init(cli.verbose);
